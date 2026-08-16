@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "toggle_key": "F12",
+  "combat_key": "v",
+  "combat_hold": 0.1,
+  "attack_key": "v",
+  "attack_hold": 0.01,
+  "alt_delay": 0.0001,
+  "double_tap_delay": 0.001,
+  "attack_delay": 0.01,
+  "use_arduino": true,
+  "auto_detect_arduino": true,
+  "serial_port": "COM7",
+  "baud_rate": 9600,
+  "trigger_key": "k"
+}
