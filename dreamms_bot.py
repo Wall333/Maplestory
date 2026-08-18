@@ -35,6 +35,10 @@ LOG_PATH = os.path.join(os.path.dirname(__file__), "recent_logs.txt")
 TRIGGER_COOLDOWN_SECONDS = 0.0
 LAST_TRIGGER_TIME = 0.0
 COMBAT_KEY_DOWN = False
+ATTACK_KEY_DOWN = False
+ATTACK_STOP_EVENT = None
+ATTACK_THREAD = None
+COMBAT_THREAD = None
 LOG_BUFFER = deque([], maxlen=300)
 LOG_WIDGET = None
 
@@ -244,38 +248,143 @@ def resolve_arduino_port(cfg):
     return cfg.get("serial_port", "COM3")
 
 
-def send_to_arduino(cfg, command="JUMP"):
-    if not cfg.get("use_arduino", False):
-        return False
+class ArduinoConnection:
+    """Persistent, serialized Arduino connection shared only at the transport layer."""
 
-    if serial is None:
-        print("pyserial is not installed. Install it with: pip install pyserial")
-        return False
+    def __init__(self):
+        self._serial = None
+        self._port = None
+        self._baud = None
+        self._lock = threading.Lock()
 
-    port = resolve_arduino_port(cfg)
-    baud = int(cfg.get("baud_rate", 9600))
-    if command == "ATTACK":
-        hold_seconds = max(0.0, float(cfg.get("attack_hold", 0.01)))
-        payloads = [f"CTRL {int(round(hold_seconds * 1000))}"]
-    else:
-        hold_seconds = max(0.0, float(cfg.get("combat_hold", 0.01)))
-        payloads = [f"ALT {int(round(hold_seconds * 1000))}"]
-        gap = max(0.0, float(cfg.get("double_tap_delay", 0.02)))
-        if gap > 0:
-            payloads.append(f"ALT {int(round(hold_seconds * 1000))}")
+    def _close_locked(self):
+        arduino = self._serial
+        self._serial = None
+        self._port = None
+        self._baud = None
+        if arduino is not None:
+            try:
+                arduino.close()
+            except Exception:
+                pass
 
-    try:
-        with serial.Serial(port, baud, timeout=0.5) as arduino:
+    def close(self):
+        with self._lock:
+            self._close_locked()
+
+    def _ensure_connected_locked(self, cfg):
+        if serial is None:
+            return None
+
+        # Reuse the already-open connection. This avoids repeatedly opening the
+        # Uno's COM port for every attack tap.
+        if self._serial is not None:
+            try:
+                if self._serial.is_open:
+                    return self._serial
+            except Exception:
+                pass
+            self._close_locked()
+
+        port = resolve_arduino_port(cfg)
+        baud = int(cfg.get("baud_rate", 9600))
+
+        arduino = serial.Serial(port, baud, timeout=0.2, write_timeout=0.2)
+        self._serial = arduino
+        self._port = port
+        self._baud = baud
+        return arduino
+
+    def send_sequence(self, cfg, payloads, gaps=None, cancel_event=None):
+        """Send one logical action without allowing another action to interleave.
+
+        Attack passes its per-hold stop event here. If Space is released while
+        attack is waiting for the serial port, the waiting CTRL is discarded
+        instead of being sent later after a combat action.
+        """
+        if not cfg.get("use_arduino", False):
+            return False
+        if serial is None:
+            print("pyserial is not installed. Install it with: pip install pyserial")
+            return False
+
+        payloads = list(payloads)
+        gaps = list(gaps or [])
+
+        # Acquire in short slices so an attack command can be cancelled while
+        # waiting behind another serial action.
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
+            if self._lock.acquire(timeout=0.005):
+                break
+
+        try:
+            if cancel_event is not None and cancel_event.is_set():
+                return False
+
+            arduino = self._ensure_connected_locked(cfg)
+            if arduino is None:
+                return False
+
             for index, payload in enumerate(payloads):
+                if cancel_event is not None and cancel_event.is_set():
+                    return False
+
                 arduino.write((payload + "\n").encode("ascii"))
                 arduino.flush()
-                if index < len(payloads) - 1 and gap > 0:
-                    time.sleep(gap)
-        return True
-    except Exception as exc:
-        print(f"Arduino send failed on {port}: {exc}")
-        return False
 
+                if index < len(payloads) - 1:
+                    gap = gaps[index] if index < len(gaps) else 0.0
+                    if gap > 0:
+                        # Combat's two ALT taps are one action, so keep the port
+                        # for the whole pair. Attack has only one payload.
+                        time.sleep(gap)
+            return True
+        except Exception as exc:
+            print(f"Arduino send failed: {exc}")
+            self._close_locked()
+            return False
+        finally:
+            self._lock.release()
+
+    def connected(self, cfg):
+        if serial is None or not cfg.get("use_arduino", False):
+            return False
+        if not self._lock.acquire(timeout=0.05):
+            # A write in progress means the connection is actively being used.
+            return True
+        try:
+            return self._ensure_connected_locked(cfg) is not None
+        except Exception:
+            self._close_locked()
+            return False
+        finally:
+            self._lock.release()
+
+
+ARDUINO = ArduinoConnection()
+
+
+def send_combat_to_arduino(cfg):
+    """Combat path: ALT only."""
+    hold_ms = int(round(max(0.0, float(cfg.get("combat_hold", 0.01))) * 1000))
+    gap = max(0.0, float(cfg.get("double_tap_delay", 0.02)))
+    return ARDUINO.send_sequence(
+        cfg,
+        [f"ALT {hold_ms}", f"ALT {hold_ms}"],
+        gaps=[gap],
+    )
+
+
+def send_attack_to_arduino(cfg, stop_event):
+    """Attack path: CTRL only; may be cancelled by Space release."""
+    hold_ms = int(round(max(0.0, float(cfg.get("attack_hold", 0.01))) * 1000))
+    return ARDUINO.send_sequence(
+        cfg,
+        [f"CTRL {hold_ms}"],
+        cancel_event=stop_event,
+    )
 
 def is_dreamms_active():
     if win32gui is None or win32process is None or psutil is None:
@@ -297,7 +406,8 @@ def is_dreamms_active():
         return False
 
 
-def trigger(cfg):
+def combat_trigger(cfg):
+    """Run one combat action. This path is completely separate from attack."""
     global LAST_TRIGGER_TIME
 
     if not cfg.get("enabled", True):
@@ -309,31 +419,119 @@ def trigger(cfg):
     LAST_TRIGGER_TIME = now
 
     if not is_dreamms_active():
-        log("DreamMS not active; ignoring trigger.")
+        log("DreamMS not active; ignoring combat trigger.")
         return
 
     delay = max(0.0, float(cfg.get("alt_delay", 0.05)))
-    log(f"Trigger fired: combat_key={cfg.get('combat_key', 'v')} | window=DreamMS.exe | delay={delay:.3f}s")
+    log(f"Combat trigger: key={cfg.get('combat_key', 'v')} | delay={delay:.3f}s")
     if delay > 0:
         time.sleep(delay)
 
     if cfg.get("use_arduino", False):
-        send_to_arduino(cfg, "JUMP")
+        send_combat_to_arduino(cfg)
     else:
         combat_step(cfg)
 
 
 def handle_combat_key_press(cfg):
-    global COMBAT_KEY_DOWN
+    global COMBAT_KEY_DOWN, COMBAT_THREAD
     if COMBAT_KEY_DOWN:
         return
+    if not cfg.get("enabled", True):
+        return
+
     COMBAT_KEY_DOWN = True
-    trigger(cfg)
+    thread = threading.Thread(
+        target=combat_trigger,
+        args=(cfg,),
+        daemon=True,
+        name="CombatAction",
+    )
+    COMBAT_THREAD = thread
+    thread.start()
 
 
 def handle_combat_key_release(event=None):
     global COMBAT_KEY_DOWN
     COMBAT_KEY_DOWN = False
+
+
+def attack_loop(cfg, stop_event):
+    """Spam CTRL while attack is held. Has its own stop event and no combat state."""
+    log(
+        f"Attack started: key={cfg.get('attack_key', 'space')} | "
+        f"hold={float(cfg.get('attack_hold', 0.01)):.4f}s | "
+        f"delay={float(cfg.get('attack_delay', 0.20)):.4f}s"
+    )
+
+    while not stop_event.is_set():
+        if not cfg.get("enabled", True) or not is_dreamms_active():
+            break
+
+        if cfg.get("use_arduino", False):
+            send_attack_to_arduino(cfg, stop_event)
+        else:
+            send_virtual_key(0x11, max(0.0, float(cfg.get("attack_hold", 0.01))))
+
+        delay = max(0.0, float(cfg.get("attack_delay", 0.20)))
+        if delay > 0 and stop_event.wait(delay):
+            break
+
+    log("Attack stopped.")
+
+
+def handle_attack_key_press(cfg):
+    global ATTACK_KEY_DOWN, ATTACK_THREAD, ATTACK_STOP_EVENT
+
+    if ATTACK_KEY_DOWN:
+        return
+    if not cfg.get("enabled", True):
+        return
+    if not is_dreamms_active():
+        return
+
+    ATTACK_KEY_DOWN = True
+
+    # Each hold gets a brand-new Event. An old worker can never be revived by
+    # clearing a shared Event during a later Space press.
+    stop_event = threading.Event()
+    ATTACK_STOP_EVENT = stop_event
+
+    thread = threading.Thread(
+        target=attack_loop,
+        args=(cfg, stop_event),
+        daemon=True,
+        name="AttackLoop",
+    )
+    ATTACK_THREAD = thread
+    thread.start()
+
+
+def stop_attack_loop(wait=False):
+    global ATTACK_KEY_DOWN, ATTACK_THREAD, ATTACK_STOP_EVENT
+
+    ATTACK_KEY_DOWN = False
+
+    stop_event = ATTACK_STOP_EVENT
+    if stop_event is not None:
+        stop_event.set()
+
+    thread = ATTACK_THREAD
+    if wait and thread is not None and thread.is_alive() and thread is not threading.current_thread():
+        # Only a short cleanup wait. An already-sent Arduino pulse cannot be
+        # recalled, but no new CTRL command will be scheduled after release.
+        thread.join(timeout=0.25)
+
+    if thread is None or not thread.is_alive():
+        if ATTACK_THREAD is thread:
+            ATTACK_THREAD = None
+        if ATTACK_STOP_EVENT is stop_event:
+            ATTACK_STOP_EVENT = None
+
+
+def handle_attack_key_release(event=None):
+    # Do not touch combat state here.
+    stop_attack_loop(wait=False)
 
 
 class App:
@@ -348,7 +546,7 @@ class App:
         frm.pack(fill=tk.BOTH, expand=True)
 
         log_frame = ttk.LabelFrame(frm, text="Recent logs")
-        log_frame.grid(row=11, column=0, columnspan=6, sticky="nsew", padx=4, pady=(12, 0))
+        log_frame.grid(row=12, column=0, columnspan=6, sticky="nsew", padx=4, pady=(12, 0))
         self.log_view = tk.Text(log_frame, height=12, width=80, state="disabled", wrap=tk.WORD)
         self.log_view.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         global LOG_WIDGET
@@ -374,6 +572,21 @@ class App:
         self.double_tap_delay = ttk.Entry(frm, width=8)
         self.double_tap_delay.insert(0, str(self.cfg.get("double_tap_delay", 0.02)))
         self.double_tap_delay.grid(row=1, column=5, sticky=tk.W, padx=4, pady=4)
+
+        ttk.Label(frm, text="Attack key:").grid(row=1, column=0, sticky=tk.W, padx=4, pady=4)
+        self.attack_key = ttk.Entry(frm, width=10)
+        self.attack_key.insert(0, self.cfg.get("attack_key", "space"))
+        self.attack_key.grid(row=1, column=1, sticky=tk.W, padx=4, pady=4)
+
+        ttk.Label(frm, text="Attack CTRL hold (s):").grid(row=1, column=2, sticky=tk.W, padx=(12, 4), pady=4)
+        self.attack_hold = ttk.Entry(frm, width=8)
+        self.attack_hold.insert(0, str(self.cfg.get("attack_hold", 0.01)))
+        self.attack_hold.grid(row=1, column=3, sticky=tk.W, padx=4, pady=4)
+
+        ttk.Label(frm, text="Attack repeat delay (s):").grid(row=2, column=2, sticky=tk.W, padx=(12, 4), pady=4)
+        self.attack_delay = ttk.Entry(frm, width=8)
+        self.attack_delay.insert(0, str(self.cfg.get("attack_delay", 0.20)))
+        self.attack_delay.grid(row=2, column=3, sticky=tk.W, padx=4, pady=4)
 
         self.use_arduino = tk.BooleanVar(value=bool(self.cfg.get("use_arduino", True)))
         ttk.Checkbutton(frm, text="Use Arduino Uno R4 WiFi", variable=self.use_arduino).grid(row=3, column=0, columnspan=2, sticky=tk.W, padx=4, pady=4)
@@ -417,8 +630,19 @@ class App:
 
     def save(self):
         try:
-            self.cfg["combat_key"] = normalize_key_name(self.combat_key.get()) or "v"
+            combat_key = normalize_key_name(self.combat_key.get()) or "v"
+            attack_key = normalize_key_name(self.attack_key.get()) or "space"
+            toggle_key = normalize_key_name(self.cfg.get("toggle_key", "F12")) or "F12"
+            if combat_key.lower() == attack_key.lower():
+                raise ValueError("Combat key and attack key must be different.")
+            if combat_key.lower() == toggle_key.lower() or attack_key.lower() == toggle_key.lower():
+                raise ValueError("Combat/attack keys must be different from the toggle key.")
+
+            self.cfg["combat_key"] = combat_key
             self.cfg["combat_hold"] = max(0.0, float(self.combat_hold.get() or 0.01))
+            self.cfg["attack_key"] = attack_key
+            self.cfg["attack_hold"] = max(0.0, float(self.attack_hold.get() or 0.01))
+            self.cfg["attack_delay"] = max(0.0, float(self.attack_delay.get() or 0.20))
             self.cfg["alt_delay"] = max(0.0, float(self.alt_delay.get() or 0.05))
             self.cfg["double_tap_delay"] = max(0.0, float(self.double_tap_delay.get() or 0.02))
             self.cfg["use_arduino"] = bool(self.use_arduino.get())
@@ -449,8 +673,17 @@ class App:
     def rebind_hotkey(self):
         if keyboard is None:
             return
-        key = normalize_key_name(self.cfg.get("combat_key", "v")) or "v"
-        toggle_key = str(self.cfg.get("toggle_key", "F12")).strip() or "F12"
+
+        combat_key = normalize_key_name(self.cfg.get("combat_key", "v")) or "v"
+        attack_key = normalize_key_name(self.cfg.get("attack_key", "space")) or "space"
+        toggle_key = normalize_key_name(self.cfg.get("toggle_key", "F12")) or "F12"
+
+        # Never permit two actions to share the same physical trigger key.
+        if combat_key.lower() == attack_key.lower():
+            log("Hotkey error: combat key and attack key are the same; action keys not bound.")
+            return
+
+        stop_attack_loop(wait=False)
 
         try:
             keyboard.unhook_all_hotkeys()
@@ -458,17 +691,47 @@ class App:
         except Exception:
             pass
 
+        # F12 always remains available so the helper can be toggled back on.
         try:
             keyboard.on_press_key(toggle_key, lambda event: self.toggle(), suppress=False)
             log(f"Toggle hotkey bound: {toggle_key}")
         except Exception as exc:
             log(f"Toggle hotkey error: {exc}")
+
+        # When disabled, do not hook the action keys at all.
+        if not self.enabled:
+            log("Helper disabled: combat/attack keys are unbound and pass through normally.")
+            return
+
         try:
-            keyboard.on_press_key(key, lambda event: handle_combat_key_press(self.cfg), suppress=False)
-            keyboard.on_release_key(key, lambda event: handle_combat_key_release(event), suppress=False)
-            log(f"Combat key bound: {key} (single trigger per press)")
+            keyboard.on_press_key(
+                combat_key,
+                lambda event: handle_combat_key_press(self.cfg),
+                suppress=False,
+            )
+            keyboard.on_release_key(
+                combat_key,
+                lambda event: handle_combat_key_release(event),
+                suppress=False,
+            )
+            log(f"Combat key bound: {combat_key} -> Arduino ALT (key passes through normally)")
         except Exception as exc:
             log(f"Combat hotkey error: {exc}")
+
+        try:
+            keyboard.on_press_key(
+                attack_key,
+                lambda event: handle_attack_key_press(self.cfg),
+                suppress=False,
+            )
+            keyboard.on_release_key(
+                attack_key,
+                lambda event: handle_attack_key_release(event),
+                suppress=False,
+            )
+            log(f"Attack key bound: {attack_key} -> Arduino CTRL spam (key passes through normally)")
+        except Exception as exc:
+            log(f"Attack hotkey error: {exc}")
 
     def update_window_status(self):
         if is_dreamms_active():
@@ -510,38 +773,43 @@ class App:
             self.arduino_status.config(text="Missing pyserial", foreground="red")
             return
 
-        port = resolve_arduino_port(self.cfg)
-        if port:
-            self.serial_port.delete(0, tk.END)
-            self.serial_port.insert(0, port)
-        else:
-            port = self.cfg.get("serial_port", "COM3")
-
         try:
-            with serial.Serial(port, int(self.cfg.get("baud_rate", 9600)), timeout=0.2):
+            if ARDUINO.connected(self.cfg):
+                port = ARDUINO._port or self.cfg.get("serial_port", "COM3")
+                if port:
+                    self.cfg["serial_port"] = port
+                    self.serial_port.delete(0, tk.END)
+                    self.serial_port.insert(0, port)
                 self.arduino_status.config(text="Connected", foreground="green")
+            else:
+                self.arduino_status.config(text="Not found", foreground="red")
         except Exception:
             self.arduino_status.config(text="Not found", foreground="red")
 
     def toggle(self):
         self.enabled = not self.enabled
         self.cfg["enabled"] = self.enabled
+        if not self.enabled:
+            stop_attack_loop(wait=False)
         save_config(self.cfg)
         self.update_toggle_status()
+        self.rebind_hotkey()
         log(f"Toggle switched to {'ON' if self.enabled else 'OFF'}")
 
     def test(self):
         try:
-            trigger(self.cfg)
+            combat_trigger(self.cfg)
         except Exception as exc:
             messagebox.showerror("Trigger failed", str(exc))
 
     def on_close(self):
+        handle_attack_key_release()
         try:
             self.cfg["enabled"] = bool(self.enabled)
             save_config(self.cfg)
         except Exception:
             pass
+        ARDUINO.close()
         if keyboard is not None:
             try:
                 keyboard.remove_hotkey(str(self.cfg.get("toggle_key", "F12")).strip() or "F12")
