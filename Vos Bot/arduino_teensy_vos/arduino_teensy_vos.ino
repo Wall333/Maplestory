@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Keyboard.h>
+#include <Mouse.h>
 
 void pressKey(uint8_t key, int delayMs) {
   Keyboard.press(key);
@@ -10,6 +11,7 @@ void pressKey(uint8_t key, int delayMs) {
 void setup() {
   Serial.begin(9600);
   Keyboard.begin();
+  Mouse.begin();
 }
 
 void loop() {
@@ -22,6 +24,7 @@ void loop() {
   int delayMs = (spaceIndex > 0) ? command.substring(spaceIndex + 1).toInt() : 10;
 
   // VoS commands.
+  if (cmd == "CLICK") Mouse.click(MOUSE_LEFT);
   if (cmd == "END") pressKey(KEY_END, delayMs);
   if (cmd == "PGDN" || cmd == "PAGEDOWN") pressKey(KEY_PAGE_DOWN, delayMs);
   if (cmd == "X") pressKey('x', delayMs);

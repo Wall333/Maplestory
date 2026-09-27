@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <Keyboard.h>
+#include <Mouse.h>
 
 void pressKey(uint8_t key, int delayMs) {
   Keyboard.press(key);
@@ -12,6 +13,7 @@ void pressKey(uint8_t key, int delayMs) {
 void setup() {
   Serial.begin(9600);
   Keyboard.begin();
+  Mouse.begin();
 }
 
 void loop() {
@@ -29,6 +31,7 @@ void loop() {
     }
 
     // Existing commands
+    if (cmd == "CLICK") Mouse.click(MOUSE_LEFT);
     if (cmd == "F") {
       pressKey('f', delayMs);
     }

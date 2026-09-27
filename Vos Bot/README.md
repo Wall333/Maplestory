@@ -57,10 +57,14 @@ The spam status overlay can be shown or hidden independently. Horizontal and
 vertical position sliders move it live using percentages of the DreamMS client,
 and the selected position is saved automatically.
 
-The optional **Yeti required** gate checks for `assets/yeti.png`. With the gate
+The optional **Yeti required** gate checks for `assets/yeti.png` or `assets/yeti2.png`. With the gate
 enabled, only skill spam pauses while the Yeti is absent, then resumes
 automatically when it is detected. Auto-alignment continues moving during this
 wait. The GUI and in-game badge distinguish the waiting state from ON/OFF.
+
+Enable **Draw box around detected Yeti** to show an orange outline at the best
+match for each Yeti template. This debug display works independently of the
+Yeti-required spam gate and uses the same Yeti threshold.
 
 Optional Thorns maintenance checks `assets/thorns.png` with its own detection
 rate and threshold. If the icon is missing during an active spam session, spam
@@ -70,6 +74,35 @@ the wait has elapsed and Thorns is detected; otherwise it retries. A small
 yellow rectangle marks the matched buff icon in the in-game overlay.
 
 ## Arduino compatibility
+
+Automatic selling is optional. Enable the inventory debug box first and show
+the inventory window: green indicates the clean grid and red indicates a
+changed grid. Selling triggers on any detected grid change, not a count of full
+slots. The inventory header must remain visible for this comparison.
+
+Inventory-triggered automatic selling requires VoS spam to be ON. The enabled
+F8 shop test can still run one cycle with spam OFF. DreamMS must be foreground.
+
+Enable **Shop test hotkey** to run one selling cycle with F8 (configurable).
+It bypasses the inventory-change trigger and works with automatic selling
+disabled. During active spam it pauses inputs for the cycle and resumes
+afterward; with spam off it runs the cycle alone. Repeated hotkey presses during
+selling are ignored. DreamMS must be foreground; losing focus cancels the test.
+
+The sequence clicks `shop.png`, waits for `shop_open.png`, clicks
+`sell_button.png`, confirms `sell_confirm.png` with Y, then requires both
+`shop_open.png` and `invent_empty.png` before clicking `shop_exit.png`. Inputs
+are spaced by one second and spam/movement pause throughout selling. The shop
+must disappear before spam resumes. Missing templates leave the sequence
+waiting rather than advancing blindly.
+
+Character and green target alignment guides hide temporarily during selling
+and return afterward if their overlay checkbox is enabled. The saved checkbox
+preference is preserved.
+
+Mouse positioning uses Windows screen coordinates; left clicks use the new
+Arduino `CLICK` command. Reflash the updated firmware once for mouse support.
+Windows fallback mode uses Windows mouse clicks instead.
 
 The updated sketch is in `arduino_teensy_vos/arduino_teensy_vos.ino`. It keeps
 all commands used by the Aran helper and adds the complete VoS key list. Because

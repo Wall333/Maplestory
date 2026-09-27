@@ -7,6 +7,7 @@ import time
 from collections import deque
 import tkinter as tk
 from tkinter import messagebox, ttk
+from shop_controller import ShopController
 
 try:
     import keyboard
@@ -50,9 +51,17 @@ AREA_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "area.png")
 LIGHTBULB_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "lightbulb.png")
 CRYSTAL_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "crystal.png")
 YETI_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "yeti.png")
+YETI2_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "yeti2.png")
 THORNS_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "thorns.png")
 
 DEFAULTS = {
+    "shop_test_enabled": True,
+    "shop_test_key": "F8",
+    "shop_enabled": True,
+    "inventory_debug": True,
+    "shop_match_threshold": 0.9,
+    "inventory_match_threshold": 0.97,
+    "inventory_detection_threshold": 0.9,
     "enabled": True,
     "toggle_key": "F11",
     "vos_enabled": True,
@@ -78,6 +87,7 @@ DEFAULTS = {
     "show_crystal": True,
     "loot_crystal": True,
     "yeti_required": True,
+    "show_yeti_overlay": False,
     "yeti_checks_per_second": 10,
     "yeti_match_threshold": 0.50,
     "buff_enabled": True,
@@ -263,7 +273,7 @@ class ArduinoConnection:
 
     def send_command(self, config, command, hold_seconds):
         command = str(command).strip().upper()
-        allowed = set(SPAM_KEYS) | {"LEFT", "RIGHT"}
+        allowed = set(SPAM_KEYS) | {"LEFT", "RIGHT", "CLICK"}
         if command not in allowed:
             return False
         payload = f"{command} {max(1, round(hold_seconds * 1000))}\n"
@@ -416,7 +426,7 @@ class VosMapDetector:
 
 
 class YetiDetector:
-    """Presence gate that pauses spam until yeti.png is visible."""
+    """Presence gate accepting either Yeti template."""
 
     def __init__(self, app):
         self.app = app
@@ -427,6 +437,11 @@ class YetiDetector:
         self.status = "Off"
         self.score = 0.0
         self.last_check = 0.0
+        self.match_rects = []
+
+    def overlay_rects(self):
+        with self.lock:
+            return list(self.match_rects), self.last_check
 
     def start(self):
         if self.thread is not None and self.thread.is_alive():
@@ -451,13 +466,14 @@ class YetiDetector:
         rate = max(1.0, float(self.app.config.get("yeti_checks_per_second", 10)))
         return matched and time.monotonic() - checked <= max(0.5, 3.0 / rate)
 
-    def _set_state(self, matched, status, score=0.0):
+    def _set_state(self, matched, status, score=0.0, rects=None):
         with self.lock:
             changed = self.matched != bool(matched) or self.status != status
             self.matched = bool(matched)
             self.status = status
             self.score = float(score)
             self.last_check = time.monotonic()
+            self.match_rects = list(rects or []) if matched else []
         if changed and status in {"Detected", "Not detected"}:
             log(f"Yeti Gate: {status} | match={score:.3f}")
 
@@ -465,16 +481,16 @@ class YetiDetector:
         if cv2 is None or mss is None or np is None:
             self._set_state(False, "Missing vision dependencies")
             return
-        template = cv2.imread(YETI_TEMPLATE_PATH, cv2.IMREAD_COLOR)
-        if template is None or template.size == 0:
+        templates = [cv2.imread(path, cv2.IMREAD_COLOR) for path in (YETI_TEMPLATE_PATH, YETI2_TEMPLATE_PATH)]
+        templates = [template for template in templates if template is not None and template.size]
+        if not templates:
             self._set_state(False, "Template missing")
             return
-        template_h, template_w = template.shape[:2]
         try:
             with mss.mss() as sct:
                 while not self.stop_event.is_set():
                     started = time.monotonic()
-                    enabled = bool(self.app.config.get("yeti_required", False))
+                    enabled = bool(self.app.config.get("yeti_required", False) or self.app.config.get("show_yeti_overlay", False))
                     rate = max(1.0, min(100.0, float(self.app.config.get("yeti_checks_per_second", 10))))
                     threshold = max(0.5, min(0.9999, float(self.app.config.get("yeti_match_threshold", 0.85))))
                     if not enabled:
@@ -485,17 +501,18 @@ class YetiDetector:
                             self._set_state(False, "Game inactive")
                         else:
                             frame = VosMapDetector._capture(sct, context[1])
-                            if frame.shape[0] < template_h or frame.shape[1] < template_w:
-                                self._set_state(False, "Not detected", 0.0)
-                            else:
+                            rects = []
+                            best_score = 0.0
+                            for template in templates:
+                                template_h, template_w = template.shape[:2]
+                                if frame.shape[0] < template_h or frame.shape[1] < template_w:
+                                    continue
                                 result = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
-                                _, score, _, _ = cv2.minMaxLoc(result)
-                                matched = float(score) >= threshold
-                                self._set_state(
-                                    matched,
-                                    "Detected" if matched else "Not detected",
-                                    score,
-                                )
+                                _, score, _, location = cv2.minMaxLoc(result)
+                                best_score = max(best_score, float(score))
+                                if score >= threshold:
+                                    rects.append((location[0], location[1], template_w, template_h))
+                            self._set_state(bool(rects), "Detected" if rects else "Not detected", best_score, rects)
                     elapsed = time.monotonic() - started
                     self.stop_event.wait(max(0.0, (1.0 / rate) - elapsed))
         except Exception as exc:
@@ -765,6 +782,8 @@ class AlignmentOverlay:
                         or self.app.config.get("show_spammer_overlay", True)
                         or self.app.config.get("show_crystal", False)
                         or self.app.config.get("buff_enabled", False)
+                        or self.app.config.get("inventory_debug", False)
+                        or self.app.config.get("show_yeti_overlay", False)
                     )
                     rate = max(1.0, min(60.0, float(self.app.config.get("alignment_checks_per_second", 10))))
                     threshold = max(0.5, min(0.9999, float(self.app.config.get("alignment_match_threshold", 0.85))))
@@ -808,13 +827,19 @@ class AlignmentOverlay:
         if self.stop_event.is_set():
             return
         status, bbox, bulb, area, _, _, _, crystal, _, _ = self.snapshot()
-        guides_enabled = bool(self.app.config.get("alignment_overlay_enabled", False))
+        guides_enabled = bool(
+            self.app.config.get("alignment_overlay_enabled", False)
+            and self.app.shop_controller.state == "idle"
+        )
         show_spammer = bool(self.app.config.get("show_spammer_overlay", True))
         show_crystal = bool(self.app.config.get("show_crystal", False))
         thorns_matched, _, _, _, thorns_rect = self.app.thorns_detector.snapshot()
         show_thorns = bool(self.app.config.get("buff_enabled", False) and thorns_matched)
+        show_inventory = bool(self.app.config.get("inventory_debug", False))
+        yeti_rects, yeti_checked = self.app.yeti_detector.overlay_rects()
+        show_yeti = bool(self.app.config.get("show_yeti_overlay", False))
         if bbox is None or not (
-            guides_enabled or show_spammer or (show_crystal and crystal is not None) or show_thorns
+            guides_enabled or show_spammer or (show_crystal and crystal is not None) or show_thorns or show_inventory or show_yeti
         ):
             self.window.withdraw()
         else:
@@ -823,6 +848,18 @@ class AlignmentOverlay:
             self.window.geometry(f"{width}x{height}+{left}+{top}")
             self.canvas.configure(width=width, height=height)
             self.canvas.delete("all")
+            if show_yeti and time.monotonic() - yeti_checked <= .5:
+                for x, y, w, h in yeti_rects:
+                    self.canvas.create_rectangle(x - 2, y - 2, x + w + 2, y + h + 2,
+                                                 outline="#ff8c00", width=2)
+            if show_inventory:
+                with self.app.shop_controller.lock:
+                    inventory_rect = self.app.shop_controller.inventory_rect
+                    inventory_changed = self.app.shop_controller.changed
+                if inventory_rect is not None:
+                    x, y, w, h = inventory_rect
+                    self.canvas.create_rectangle(x, y, x + w, y + h,
+                        outline="#ff3030" if inventory_changed else "#39ff14", width=2)
 
             target_mode = self.app.config.get("alignment_target_mode", "area")
             target_marker = None
@@ -872,9 +909,11 @@ class AlignmentOverlay:
 
             if show_spammer:
                 spam_on = bool(self.app.spam_active)
-                waiting = spam_on and bool(self.app.spam_paused_reason)
+                waiting = bool(self.app.spam_paused_reason) and (
+                    spam_on or self.app.shop_controller.state != "idle"
+                )
                 if waiting:
-                    label = "SPAMMER WAITING"
+                    label = "SELLING" if self.app.spam_paused_reason.startswith("Selling") else "SPAMMER WAITING"
                     color = "#ffc400"
                 else:
                     label = "SPAMMER ON" if spam_on else "SPAMMER OFF"
@@ -965,6 +1004,7 @@ class VosApp:
         self.map_detector = VosMapDetector(self)
         self.yeti_detector = YetiDetector(self)
         self.thorns_detector = ThornsDetector(self)
+        self.shop_controller = ShopController(self, globals())
         self.alignment_overlay = None
         self.auto_align_stop = threading.Event()
         self.auto_align_thread = None
@@ -983,6 +1023,7 @@ class VosApp:
         self.map_detector.start()
         self.yeti_detector.start()
         self.thorns_detector.start()
+        self.shop_controller.start()
         self.alignment_overlay.start()
         self.start_auto_align_controller()
         self.rebind_hotkeys()
@@ -1053,6 +1094,44 @@ class VosApp:
         self.thorns_status = ttk.Label(status, text="Off")
         self.thorns_status.grid(row=8, column=1, sticky="w", padx=10)
 
+        shop = ttk.LabelFrame(outer, text="Inventory / Selling", padding=10)
+        shop.pack(fill="x", pady=10)
+        self.shop_enabled = tk.BooleanVar(value=self.config["shop_enabled"])
+        self.inventory_debug = tk.BooleanVar(value=self.config["inventory_debug"])
+        def update_shop_options():
+            self.config["shop_enabled"] = self.shop_enabled.get()
+            self.config["inventory_debug"] = self.inventory_debug.get()
+            save_config(self.config)
+        ttk.Checkbutton(shop, text="Enable automatic selling", variable=self.shop_enabled,
+                        command=update_shop_options).pack(anchor="w")
+        ttk.Checkbutton(shop, text="Draw inventory debug box", variable=self.inventory_debug,
+                        command=update_shop_options).pack(anchor="w")
+        self.shop_status = ttk.Label(shop, text="Off")
+        self.shop_status.pack(anchor="w")
+        self.shop_test_enabled = tk.BooleanVar(value=self.config["shop_test_enabled"])
+        def update_shop_test():
+            self.config["shop_test_enabled"] = self.shop_test_enabled.get()
+            save_config(self.config)
+        ttk.Checkbutton(shop, text="Enable shop test hotkey", variable=self.shop_test_enabled,
+                        command=update_shop_test).pack(anchor="w")
+        ttk.Label(shop, text="Shop test hotkey (press once):").pack(anchor="w")
+        self.shop_test_key = ttk.Entry(shop, width=14)
+        self.shop_test_key.insert(0, self.config["shop_test_key"])
+        self.shop_test_key.pack(anchor="w")
+        ttk.Label(shop, text="Inventory detection threshold (header):").pack(anchor="w", pady=(6, 0))
+        self.inventory_detection_threshold = ttk.Entry(shop, width=14)
+        self.inventory_detection_threshold.insert(0, str(self.config["inventory_detection_threshold"]))
+        self.inventory_detection_threshold.pack(anchor="w")
+        ttk.Label(shop, text="Clean inventory similarity threshold:").pack(anchor="w", pady=(6, 0))
+        self.inventory_match_threshold = ttk.Entry(shop, width=14)
+        self.inventory_match_threshold.insert(0, str(self.config["inventory_match_threshold"]))
+        self.inventory_match_threshold.pack(anchor="w")
+        ttk.Label(shop, text="Below this similarity triggers selling; higher = more sensitive.").pack(anchor="w")
+        ttk.Label(shop, text="Shop / selling image match threshold:").pack(anchor="w", pady=(6, 0))
+        self.shop_match_threshold = ttk.Entry(shop, width=14)
+        self.shop_match_threshold.insert(0, str(self.config["shop_match_threshold"]))
+        self.shop_match_threshold.pack(anchor="w")
+
         vos = ttk.LabelFrame(outer, text="VoS Spam", padding=10)
         vos.pack(fill="x", pady=(10, 0))
         self.vos_enabled = tk.BooleanVar(value=bool(self.config["vos_enabled"]))
@@ -1090,6 +1169,12 @@ class VosApp:
         self.yeti_threshold = ttk.Entry(vos, width=14)
         self.yeti_threshold.insert(0, str(self.config["yeti_match_threshold"]))
         self.yeti_threshold.grid(row=8, column=1, sticky="w")
+        self.show_yeti_overlay = tk.BooleanVar(value=self.config["show_yeti_overlay"])
+        def update_yeti_overlay():
+            self.config["show_yeti_overlay"] = self.show_yeti_overlay.get()
+            save_config(self.config)
+        ttk.Checkbutton(vos, text="Draw box around detected Yeti", variable=self.show_yeti_overlay,
+                        command=update_yeti_overlay).grid(row=9, column=0, columnspan=2, sticky="w")
 
         buff = ttk.LabelFrame(outer, text="Thorns Buff", padding=10)
         buff.pack(fill="x", pady=(10, 0))
@@ -1296,6 +1381,19 @@ class VosApp:
             self.settings_canvas.yview_scroll(-1 if delta > 0 else 1, "units")
 
     def read_form(self):
+        shop_thresholds = {
+            "inventory_detection_threshold": float(self.inventory_detection_threshold.get()),
+            "inventory_match_threshold": float(self.inventory_match_threshold.get()),
+            "shop_match_threshold": float(self.shop_match_threshold.get()),
+        }
+        for name, value in shop_thresholds.items():
+            if not 0.5 <= value <= 0.9999:
+                raise ValueError(f"{name.replace('_', ' ')} must be between 0.5 and 0.9999.")
+        test_key = self.shop_test_key.get().strip() or "F8"
+        if test_key.lower() in {self.master_key.get().strip().lower(), self.vos_toggle_key.get().strip().lower()}:
+            raise ValueError("Shop test hotkey must differ from master and VoS hotkeys.")
+        self.config["shop_test_key"] = test_key
+        self.config.update(shop_thresholds)
         hold = float(self.hold.get())
         interval = float(self.interval.get())
         baud = int(self.baud_rate.get())
@@ -1372,6 +1470,7 @@ class VosApp:
             "yeti_required": bool(self.yeti_required.get()),
             "yeti_checks_per_second": yeti_rate,
             "yeti_match_threshold": yeti_threshold,
+            "show_yeti_overlay": bool(self.show_yeti_overlay.get()),
             "buff_enabled": bool(self.buff_enabled.get()),
             "buff_key": normalize_output_key(self.buff_key.get()),
             "buff_key_hold": buff_hold,
@@ -1426,6 +1525,9 @@ class VosApp:
                 )
             )
             log(f"Hotkeys bound: master={self.config['toggle_key']}, VoS={self.config['vos_toggle_key']}")
+            self.hotkey_handles.append(keyboard.add_hotkey(
+                self.config["shop_test_key"], lambda: self.ui_actions.put("shop_test"),
+                suppress=False, trigger_on_release=True))
         except Exception as exc:
             for handle in self.hotkey_handles:
                 try:
@@ -1446,6 +1548,41 @@ class VosApp:
                 self.toggle_master()
             elif action == "toggle_vos":
                 self.toggle_vos()
+            elif action == "shop_test":
+                self.run_shop_test()
+
+    def run_shop_test(self):
+        if not self.config.get("shop_test_enabled", False):
+            return
+        if not is_dreamms_active():
+            log("Shop test blocked: DreamMS is not active")
+            return
+        if self.shop_controller.state != "idle":
+            log("Shop test ignored: selling is already running")
+            return
+        if not self.spam_active and self.worker is not None and self.worker.is_alive():
+            log("Shop test: wait for the previous worker to stop")
+            return
+        self.shop_controller.request_test()
+        self.spam_paused_reason = "Selling: test"
+        log("Shop test requested: one cycle")
+        if not self.spam_active:
+            self.stop_event.clear()
+            self.worker = threading.Thread(target=self._shop_test_loop, daemon=True, name="shop-test")
+            self.worker.start()
+
+    def _shop_test_loop(self):
+        try:
+            while not self.stop_event.is_set():
+                if not is_dreamms_active():
+                    self.stop_vos("Shop test lost game focus")
+                    return
+                if not self.shop_controller.tick():
+                    return
+                self.stop_event.wait(.05)
+        finally:
+            self.shop_controller.reset()
+            self.spam_paused_reason = None
 
     def on_vos_enabled_changed(self):
         self.config["vos_enabled"] = bool(self.vos_enabled.get())
@@ -1599,6 +1736,10 @@ class VosApp:
                 self.auto_align_delta = None
                 self.auto_align_stop.wait(0.10)
                 continue
+            if self.shop_controller.state != "idle":
+                self.auto_align_direction = "Selling"
+                self.auto_align_stop.wait(.1)
+                continue
             # The Yeti gate controls only skill spam. Movement alignment should
             # continue while waiting for a Yeti. Other maintenance pauses,
             # such as casting/recovering Thorns, still pause movement.
@@ -1686,6 +1827,12 @@ class VosApp:
         log(f"Master helper {'ON' if self.master_enabled else 'OFF'}")
 
     def toggle_vos(self):
+        if not self.spam_active and self.worker is not None and self.worker.is_alive():
+            log("VoS start blocked: selling or previous worker is still running")
+            return
+        if not self.spam_active and self.shop_controller.state != "idle":
+            log("VoS start blocked: shop test is running")
+            return
         if self.spam_active:
             self.stop_vos("toggle pressed")
             return
@@ -1712,6 +1859,7 @@ class VosApp:
         log(f"VoS spam ON ({self.config['vos_output_key']})")
 
     def stop_vos(self, reason="stopped"):
+        self.shop_controller.reset()
         was_active = self.spam_active
         self.stop_event.set()
         self.spam_active = False
@@ -1732,6 +1880,9 @@ class VosApp:
             if not self.map_detector.allows_spam():
                 self.stop_vos("VoS map not detected")
                 return
+            if self.shop_controller.tick():
+                self.stop_event.wait(.05)
+                continue
             if self.config.get("buff_enabled", False):
                 now = time.monotonic()
                 if now < self.buff_resume_not_before:
@@ -1781,13 +1932,14 @@ class VosApp:
         active = is_dreamms_active()
         self.window_status.configure(text="Active" if active else "Inactive", foreground="green" if active else "red")
         self.master_status.configure(text="On" if self.master_enabled else "Off", foreground="green" if self.master_enabled else "red")
-        if self.spam_active and self.spam_paused_reason:
-            vos_text, vos_color = f"Waiting for Yeti ({self.send_count} sent)", "orange"
+        if self.spam_paused_reason and (self.spam_active or self.shop_controller.state != "idle"):
+            vos_text, vos_color = self.spam_paused_reason, "orange"
         elif self.spam_active:
             vos_text, vos_color = f"Running ({self.send_count} sent)", "green"
         else:
             vos_text, vos_color = "Off", "red"
         self.vos_status.configure(text=vos_text, foreground=vos_color)
+        self.shop_status.configure(text=self.shop_controller.status)
         map_matched, map_text, map_score, _ = self.map_detector.snapshot()
         if not self.config.get("vos_map_checker_enabled", True):
             map_color = "gray"
@@ -1825,6 +1977,8 @@ class VosApp:
                 crystal_text = f", crystal {crystal_score:.2f}" if crystal is not None else ", crystal waiting"
                 detail = (detail[:-1] + crystal_text + ")") if detail else f" ({crystal_text[2:]})"
             self.alignment_status.configure(text=overlay_text + detail, foreground=overlay_color)
+            if self.shop_controller.state != "idle":
+                self.alignment_status.configure(text="Hidden during selling", foreground="gray")
         if not self.config.get("auto_align_enabled", False):
             auto_text, auto_color = "Off", "gray"
         else:
@@ -1872,6 +2026,7 @@ class VosApp:
         self.map_detector.stop()
         self.yeti_detector.stop()
         self.thorns_detector.stop()
+        self.shop_controller.stop()
         self.auto_align_stop.set()
         if self.auto_align_thread is not None and self.auto_align_thread.is_alive():
             self.auto_align_thread.join(timeout=1.0)
