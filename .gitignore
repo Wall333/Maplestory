@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+*.log
+recent_logs.txt
+.build/
+.dist/
+*.spec

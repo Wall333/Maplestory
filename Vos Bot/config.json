@@ -1,0 +1,23 @@
+{
+  "enabled": true,
+  "toggle_key": "F11",
+  "vos_enabled": true,
+  "vos_toggle_key": "F10",
+  "vos_output_key": "X",
+  "vos_hold": 0.03,
+  "vos_interval": 3.0,
+  "vos_map_checker_enabled": true,
+  "vos_map_checks_per_second": 10.0,
+  "vos_map_match_threshold": 0.9,
+  "alignment_overlay_enabled": true,
+  "alignment_checks_per_second": 10.0,
+  "alignment_match_threshold": 0.7,
+  "auto_align_enabled": true,
+  "auto_align_tolerance_pixels": 100,
+  "auto_align_key_hold": 0.5,
+  "auto_align_interval": 0.5,
+  "use_arduino": true,
+  "auto_detect_arduino": true,
+  "serial_port": "COM3",
+  "baud_rate": 9600
+}

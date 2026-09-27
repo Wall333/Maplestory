@@ -1,44 +1,28 @@
-# DreamMS Helper
+# MapleStory helper projects
 
-Small Windows utility to send a simple "combat step" key sequence to DreamMS.exe only when the game window is active.
+This repository contains two independent Windows utilities. Each lives in its
+own folder with separate configuration, documentation, launcher, dependencies,
+and Arduino firmware.
 
-Install:
+## Projects
 
-```powershell
-python -m pip install -r requirements.txt
-```
+- [`Aran keybinds`](Aran%20keybinds/README.md) — configurable Aran combat,
+  attack, combo, combo-drain, Fenrir, and visual safety helpers.
+- [`Vos Bot`](Vos%20Bot/README.md) — configurable VoS key spam, map checking,
+  visual alignment overlay, and optional left/right auto-alignment.
 
-Run:
+## Portable Windows builds
 
-```powershell
-python "dreamms_bot.py"
-```
+Ready-to-run packages are placed in `Releases/` when built. Extract one ZIP and
+run the `.exe`; Python and pip are not required on the destination PC. The
+Arduino still needs the matching shared firmware flashed once.
 
-Usage:
-- F12 toggles the bot on/off (default). The bot only triggers when the foreground window is `DreamMS.exe`.
-- Use the GUI to change the combat key (default `v`) and save settings (persisted to `config.json`).
-- The "Trigger CombatStep" button in the GUI performs the action manually.
-
-Notes:
-- This tool uses low-level SendInput calls; some games may block synthetic input. If it doesn't work, run with administrator privileges or try other input methods.
- - This tool uses low-level SendInput calls; some games may block synthetic input. The script will try `pydirectinput` (DirectInput) if installed, which often works with games. If it still doesn't work, run with administrator privileges or try sending window messages.
- - This tool uses low-level SendInput calls; some games may block synthetic input. The script will try `pydirectinput` (DirectInput) if installed, which often works with games. If it still doesn't work, run with administrator privileges or try sending window messages.
-
-DLL injection (advanced)
-- A minimal DLL + injector are included for an in-process injection approach. This will load a DLL into the game's process and the DLL sends an Alt keypress from inside the process. This is powerful and risky: it can trigger anti-cheat or be considered a modification to the game process. Use at your own risk.
-
-Build DLL (MSVC):
+To rebuild both packages on a development PC, install the source dependencies
+and PyInstaller, then run:
 
 ```powershell
-cd "d:\Script projects\Tarkov\maplestory scripts"
-cl /LD dll_sendalt.c user32.lib
+.\build_portable.ps1
 ```
 
-Inject DLL (requires Administrator):
-
-```powershell
-python inject_dll.py DreamMS.exe dll_sendalt.dll
-```
-
-Warnings:
-- DLL injection and driver-level methods can violate terms of service and may cause bans. Prefer hardware HID if you want reliability without modifying the game process.
+These tools are intended for the owner's test environment. Review the rules of
+any server or software before using automation.
