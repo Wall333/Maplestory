@@ -48,25 +48,44 @@ LOG_PATH = os.path.join(BASE_DIR, "recent_logs.txt")
 VOS_MAP_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "VOS_map.png")
 AREA_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "area.png")
 LIGHTBULB_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "lightbulb.png")
+CRYSTAL_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "crystal.png")
+YETI_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "yeti.png")
+THORNS_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "thorns.png")
 
 DEFAULTS = {
     "enabled": True,
     "toggle_key": "F11",
     "vos_enabled": True,
     "vos_toggle_key": "F10",
-    "vos_output_key": "END",
+    "vos_output_key": "F",
     "vos_hold": 0.03,
-    "vos_interval": 0.15,
+    "vos_interval": 2.0,
     "vos_map_checker_enabled": True,
     "vos_map_checks_per_second": 10,
-    "vos_map_match_threshold": 0.90,
-    "alignment_overlay_enabled": False,
+    "vos_map_match_threshold": 0.60,
+    "alignment_overlay_enabled": True,
     "alignment_checks_per_second": 10,
-    "alignment_match_threshold": 0.85,
-    "auto_align_enabled": False,
-    "auto_align_tolerance_pixels": 8,
-    "auto_align_key_hold": 0.03,
-    "auto_align_interval": 0.10,
+    "alignment_match_threshold": 0.70,
+    "alignment_target_mode": "manual",
+    "manual_anchor_offset": 0,
+    "auto_align_enabled": True,
+    "auto_align_tolerance_pixels": 200,
+    "auto_align_key_hold": 0.5,
+    "auto_align_interval": 0.5,
+    "show_spammer_overlay": True,
+    "spam_overlay_x_percent": 85,
+    "spam_overlay_y_percent": 4,
+    "show_crystal": True,
+    "loot_crystal": True,
+    "yeti_required": True,
+    "yeti_checks_per_second": 10,
+    "yeti_match_threshold": 0.50,
+    "buff_enabled": True,
+    "buff_key": "END",
+    "buff_key_hold": 0.03,
+    "buff_wait_seconds": 5.0,
+    "thorns_checks_per_second": 10,
+    "thorns_match_threshold": 0.50,
     "use_arduino": True,
     "auto_detect_arduino": True,
     "serial_port": "COM3",
@@ -396,6 +415,189 @@ class VosMapDetector:
             self._set_state(False, f"Detector error: {exc}")
 
 
+class YetiDetector:
+    """Presence gate that pauses spam until yeti.png is visible."""
+
+    def __init__(self, app):
+        self.app = app
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.lock = threading.Lock()
+        self.matched = False
+        self.status = "Off"
+        self.score = 0.0
+        self.last_check = 0.0
+
+    def start(self):
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._loop, name="yeti-detector", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+
+    def snapshot(self):
+        with self.lock:
+            return self.matched, self.status, self.score, self.last_check
+
+    def allows_spam(self):
+        if not self.app.config.get("yeti_required", False):
+            return True
+        matched, _, _, checked = self.snapshot()
+        rate = max(1.0, float(self.app.config.get("yeti_checks_per_second", 10)))
+        return matched and time.monotonic() - checked <= max(0.5, 3.0 / rate)
+
+    def _set_state(self, matched, status, score=0.0):
+        with self.lock:
+            changed = self.matched != bool(matched) or self.status != status
+            self.matched = bool(matched)
+            self.status = status
+            self.score = float(score)
+            self.last_check = time.monotonic()
+        if changed and status in {"Detected", "Not detected"}:
+            log(f"Yeti Gate: {status} | match={score:.3f}")
+
+    def _loop(self):
+        if cv2 is None or mss is None or np is None:
+            self._set_state(False, "Missing vision dependencies")
+            return
+        template = cv2.imread(YETI_TEMPLATE_PATH, cv2.IMREAD_COLOR)
+        if template is None or template.size == 0:
+            self._set_state(False, "Template missing")
+            return
+        template_h, template_w = template.shape[:2]
+        try:
+            with mss.mss() as sct:
+                while not self.stop_event.is_set():
+                    started = time.monotonic()
+                    enabled = bool(self.app.config.get("yeti_required", False))
+                    rate = max(1.0, min(100.0, float(self.app.config.get("yeti_checks_per_second", 10))))
+                    threshold = max(0.5, min(0.9999, float(self.app.config.get("yeti_match_threshold", 0.85))))
+                    if not enabled:
+                        self._set_state(True, "Off", 1.0)
+                    else:
+                        context = get_active_dreamms_context()
+                        if context is None:
+                            self._set_state(False, "Game inactive")
+                        else:
+                            frame = VosMapDetector._capture(sct, context[1])
+                            if frame.shape[0] < template_h or frame.shape[1] < template_w:
+                                self._set_state(False, "Not detected", 0.0)
+                            else:
+                                result = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
+                                _, score, _, _ = cv2.minMaxLoc(result)
+                                matched = float(score) >= threshold
+                                self._set_state(
+                                    matched,
+                                    "Detected" if matched else "Not detected",
+                                    score,
+                                )
+                    elapsed = time.monotonic() - started
+                    self.stop_event.wait(max(0.0, (1.0 / rate) - elapsed))
+        except Exception as exc:
+            self._set_state(False, f"Detector error: {exc}")
+
+
+class ThornsDetector:
+    """Tracks the Thorns buff icon and its client-relative rectangle."""
+
+    def __init__(self, app):
+        self.app = app
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.lock = threading.Lock()
+        self.matched = False
+        self.status = "Off"
+        self.score = 0.0
+        self.last_check = 0.0
+        self.match_rect = None
+
+    def start(self):
+        if self.thread is not None and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._loop, name="thorns-detector", daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread is not None and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+
+    def snapshot(self):
+        with self.lock:
+            return self.matched, self.status, self.score, self.last_check, self.match_rect
+
+    def allows_spam(self):
+        if not self.app.config.get("buff_enabled", False):
+            return True
+        matched, _, _, checked, _ = self.snapshot()
+        rate = max(1.0, float(self.app.config.get("thorns_checks_per_second", 10)))
+        return matched and time.monotonic() - checked <= max(0.5, 3.0 / rate)
+
+    def _set_state(self, matched, status, score=0.0, match_rect=None):
+        with self.lock:
+            changed = self.matched != bool(matched) or self.status != status
+            self.matched = bool(matched)
+            self.status = status
+            self.score = float(score)
+            self.last_check = time.monotonic()
+            self.match_rect = match_rect if matched else None
+        if changed and status in {"Active", "Missing"}:
+            log(f"Thorns Buff: {status} | match={score:.3f}")
+
+    def _loop(self):
+        if cv2 is None or mss is None or np is None:
+            self._set_state(False, "Missing vision dependencies")
+            return
+        template = cv2.imread(THORNS_TEMPLATE_PATH, cv2.IMREAD_COLOR)
+        if template is None or template.size == 0:
+            self._set_state(False, "Template missing")
+            return
+        template_h, template_w = template.shape[:2]
+        try:
+            with mss.mss() as sct:
+                while not self.stop_event.is_set():
+                    started = time.monotonic()
+                    enabled = bool(self.app.config.get("buff_enabled", False))
+                    rate = max(1.0, min(100.0, float(self.app.config.get("thorns_checks_per_second", 10))))
+                    threshold = max(0.5, min(0.9999, float(self.app.config.get("thorns_match_threshold", 0.85))))
+                    if not enabled:
+                        self._set_state(True, "Off", 1.0)
+                    else:
+                        context = get_active_dreamms_context()
+                        if context is None:
+                            self._set_state(False, "Game inactive")
+                        else:
+                            frame = VosMapDetector._capture(sct, context[1])
+                            if frame.shape[0] < template_h or frame.shape[1] < template_w:
+                                self._set_state(False, "Missing", 0.0)
+                            else:
+                                result = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
+                                _, score, _, location = cv2.minMaxLoc(result)
+                                matched = float(score) >= threshold
+                                rect = (
+                                    int(location[0]),
+                                    int(location[1]),
+                                    int(template_w),
+                                    int(template_h),
+                                ) if matched else None
+                                self._set_state(
+                                    matched,
+                                    "Active" if matched else "Missing",
+                                    score,
+                                    rect,
+                                )
+                    elapsed = time.monotonic() - started
+                    self.stop_event.wait(max(0.0, (1.0 / rate) - elapsed))
+        except Exception as exc:
+            self._set_state(False, f"Detector error: {exc}")
+
+
 class AlignmentOverlay:
     """Find the light bulb and target area and draw click-through guides."""
 
@@ -412,6 +614,11 @@ class AlignmentOverlay:
         self.area_match = None
         self.bulb_score = 0.0
         self.area_score = 0.0
+        self.crystal_match = None
+        self.crystal_score = 0.0
+        self.crystal_generation = 0
+        self.crystal_visible = False
+        self.crystal_missing_frames = 0
         self.status = "Off"
         self.last_check = 0.0
 
@@ -476,7 +683,44 @@ class AlignmentOverlay:
                 self.bulb_score,
                 self.area_score,
                 self.last_check,
+                self.crystal_match,
+                self.crystal_score,
+                self.crystal_generation,
             )
+
+    def clear_crystal(self):
+        with self.lock:
+            self.crystal_match = None
+            self.crystal_score = 0.0
+            self.crystal_visible = False
+            self.crystal_missing_frames = 0
+
+    def _update_crystal(self, match, score, rate):
+        with self.lock:
+            if match is not None:
+                is_new = not self.crystal_visible
+                if self.crystal_match is not None:
+                    old_x = self.crystal_match[0] + self.crystal_match[2] / 2.0
+                    new_x = match[0] + match[2] / 2.0
+                    is_new = is_new or abs(new_x - old_x) > 8
+                if is_new:
+                    self.crystal_generation += 1
+                    log(
+                        f"Crystal target detected: generation={self.crystal_generation}, "
+                        f"x={match[0] + match[2] / 2.0:.1f}, match={score:.3f}"
+                    )
+                self.crystal_match = match
+                self.crystal_score = float(score)
+                self.crystal_visible = True
+                self.crystal_missing_frames = 0
+            else:
+                self.crystal_score = float(score)
+                self.crystal_missing_frames += 1
+                if self.crystal_missing_frames >= max(2, int(rate * 0.5)):
+                    if self.crystal_match is not None:
+                        log("Crystal target cleared: crystal is no longer detected")
+                    self.crystal_visible = False
+                    self.crystal_match = None
 
     def _set_results(self, status, context=None, bulb=None, area=None, bulb_score=0.0, area_score=0.0):
         with self.lock:
@@ -507,7 +751,8 @@ class AlignmentOverlay:
             return
         bulb = cv2.imread(LIGHTBULB_TEMPLATE_PATH, cv2.IMREAD_COLOR)
         area = cv2.imread(AREA_TEMPLATE_PATH, cv2.IMREAD_COLOR)
-        if bulb is None or area is None:
+        crystal = cv2.imread(CRYSTAL_TEMPLATE_PATH, cv2.IMREAD_COLOR)
+        if bulb is None or area is None or crystal is None:
             self._set_results("Overlay template missing")
             return
         try:
@@ -517,6 +762,9 @@ class AlignmentOverlay:
                     enabled = bool(
                         self.app.config.get("alignment_overlay_enabled", False)
                         or self.app.config.get("auto_align_enabled", False)
+                        or self.app.config.get("show_spammer_overlay", True)
+                        or self.app.config.get("show_crystal", False)
+                        or self.app.config.get("buff_enabled", False)
                     )
                     rate = max(1.0, min(60.0, float(self.app.config.get("alignment_checks_per_second", 10))))
                     threshold = max(0.5, min(0.9999, float(self.app.config.get("alignment_match_threshold", 0.85))))
@@ -530,7 +778,17 @@ class AlignmentOverlay:
                             frame = VosMapDetector._capture(sct, context[1])
                             bulb_match, bulb_score = self._best_match(frame, bulb, threshold)
                             area_match, area_score = self._best_match(frame, area, threshold)
-                            if bulb_match and area_match:
+                            if self.app.config.get("show_crystal", False):
+                                crystal_match, crystal_score = self._best_match(frame, crystal, threshold)
+                                self._update_crystal(crystal_match, crystal_score, rate)
+                            else:
+                                self.clear_crystal()
+                            manual_target = self.app.config.get("alignment_target_mode", "area") == "manual"
+                            if manual_target and bulb_match:
+                                status = "Character + manual anchor"
+                            elif manual_target:
+                                status = "Light bulb not detected"
+                            elif bulb_match and area_match:
                                 status = "Both matched"
                             elif bulb_match:
                                 status = "Area not detected"
@@ -549,9 +807,15 @@ class AlignmentOverlay:
     def render(self):
         if self.stop_event.is_set():
             return
-        status, bbox, bulb, area, _, _, _ = self.snapshot()
-        enabled = bool(self.app.config.get("alignment_overlay_enabled", False))
-        if not enabled or bbox is None or (bulb is None and area is None):
+        status, bbox, bulb, area, _, _, _, crystal, _, _ = self.snapshot()
+        guides_enabled = bool(self.app.config.get("alignment_overlay_enabled", False))
+        show_spammer = bool(self.app.config.get("show_spammer_overlay", True))
+        show_crystal = bool(self.app.config.get("show_crystal", False))
+        thorns_matched, _, _, _, thorns_rect = self.app.thorns_detector.snapshot()
+        show_thorns = bool(self.app.config.get("buff_enabled", False) and thorns_matched)
+        if bbox is None or not (
+            guides_enabled or show_spammer or (show_crystal and crystal is not None) or show_thorns
+        ):
             self.window.withdraw()
         else:
             left, top, right, bottom = bbox
@@ -560,21 +824,79 @@ class AlignmentOverlay:
             self.canvas.configure(width=width, height=height)
             self.canvas.delete("all")
 
-            if area is not None:
+            target_mode = self.app.config.get("alignment_target_mode", "area")
+            target_marker = None
+            target_label = "TARGET"
+            if target_mode == "manual":
+                offset = int(self.app.config.get("manual_anchor_offset", 0))
+                center_x = max(0, min(width - 1, width // 2 + offset))
+                target_marker = (center_x, height // 2)
+                target_label = f"MANUAL TARGET {offset:+d}px"
+            elif area is not None:
                 x, y, w, h = area
-                center_x = x + w // 2
-                center_y = y + h // 2
+                target_marker = (x + w // 2, y + h // 2)
+
+            if guides_enabled and target_marker is not None:
+                center_x, center_y = target_marker
                 self.canvas.create_line(center_x, 0, center_x, height, fill="#39ff14", width=2, dash=(8, 5))
                 self.canvas.create_oval(center_x - 5, center_y - 5, center_x + 5, center_y + 5, outline="#39ff14", width=2)
-                self.canvas.create_text(center_x + 8, max(10, center_y - 10), text="TARGET", fill="#39ff14", anchor="w")
+                self.canvas.create_text(center_x + 8, max(10, center_y - 10), text=target_label, fill="#39ff14", anchor="w")
 
-            if bulb is not None:
+            if guides_enabled and bulb is not None:
                 x, y, w, h = bulb
                 center_x = x + w // 2
                 line_start = y + h
                 self.canvas.create_line(center_x, line_start, center_x, height, fill="#00e5ff", width=2)
                 self.canvas.create_oval(center_x - 5, y + h // 2 - 5, center_x + 5, y + h // 2 + 5, outline="#00e5ff", width=2)
                 self.canvas.create_text(center_x + 8, line_start + 8, text="CHARACTER", fill="#00e5ff", anchor="nw")
+
+            if show_crystal and crystal is not None:
+                x, y, w, h = crystal
+                center_x = x + w // 2
+                center_y = y + h // 2
+                self.canvas.create_line(center_x, 0, center_x, height, fill="#ff2020", width=3)
+                self.canvas.create_oval(center_x - 6, center_y - 6, center_x + 6, center_y + 6, outline="#ff2020", width=3)
+                self.canvas.create_text(center_x + 9, max(10, center_y - 12), text="CRYSTAL", fill="#ff2020", anchor="w")
+
+            if show_thorns and thorns_rect is not None:
+                x, y, w, h = thorns_rect
+                padding = 3
+                self.canvas.create_rectangle(
+                    x - padding,
+                    y - padding,
+                    x + w + padding,
+                    y + h + padding,
+                    outline="#ffd400",
+                    width=2,
+                )
+
+            if show_spammer:
+                spam_on = bool(self.app.spam_active)
+                waiting = spam_on and bool(self.app.spam_paused_reason)
+                if waiting:
+                    label = "SPAMMER WAITING"
+                    color = "#ffc400"
+                else:
+                    label = "SPAMMER ON" if spam_on else "SPAMMER OFF"
+                    color = "#21d921" if spam_on else "#ff3030"
+                badge_width, badge_height = 185, 44
+                x_percent = max(0, min(100, int(self.app.config.get("spam_overlay_x_percent", 85))))
+                y_percent = max(0, min(100, int(self.app.config.get("spam_overlay_y_percent", 5))))
+                center_x = round((width - 1) * x_percent / 100.0)
+                center_y = round((height - 1) * y_percent / 100.0)
+                half_w, half_h = badge_width // 2, badge_height // 2
+                center_x = max(half_w + 4, min(width - half_w - 4, center_x))
+                center_y = max(half_h + 4, min(height - half_h - 4, center_y))
+                x1, x2 = center_x - half_w, center_x + half_w
+                y1, y2 = center_y - half_h, center_y + half_h
+                self.canvas.create_rectangle(x1, y1, x2, y2, fill="#101010", outline=color, width=3)
+                self.canvas.create_text(
+                    center_x,
+                    center_y,
+                    text=label,
+                    fill=color,
+                    font=("Segoe UI", 18, "bold"),
+                )
 
             self.window.deiconify()
             self.window.lift()
@@ -631,6 +953,8 @@ class VosApp:
         self.config = load_config()
         self.master_enabled = bool(self.config["enabled"])
         self.spam_active = False
+        self.spam_paused_reason = None
+        self.buff_resume_not_before = 0.0
         self.stop_event = threading.Event()
         self.worker = None
         self.send_count = 0
@@ -639,20 +963,26 @@ class VosApp:
         self.hotkey_handles = []
         self.ui_actions = queue.SimpleQueue()
         self.map_detector = VosMapDetector(self)
+        self.yeti_detector = YetiDetector(self)
+        self.thorns_detector = ThornsDetector(self)
         self.alignment_overlay = None
         self.auto_align_stop = threading.Event()
         self.auto_align_thread = None
         self.auto_align_direction = "Idle"
         self.auto_align_delta = None
         self.auto_align_move_count = 0
+        self._anchor_save_job = None
+        self._overlay_position_save_job = None
 
         root.title("DreamMS VoS Helper")
-        root.geometry("650x980")
-        root.minsize(600, 850)
+        root.geometry("670x850")
+        root.minsize(540, 480)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self._build_ui()
         self.alignment_overlay = AlignmentOverlay(self)
         self.map_detector.start()
+        self.yeti_detector.start()
+        self.thorns_detector.start()
         self.alignment_overlay.start()
         self.start_auto_align_controller()
         self.rebind_hotkeys()
@@ -660,8 +990,38 @@ class VosApp:
         log("VoS helper started")
 
     def _build_ui(self):
-        outer = ttk.Frame(self.root, padding=12)
-        outer.pack(fill="both", expand=True)
+        scroll_host = ttk.Frame(self.root)
+        scroll_host.pack(fill="both", expand=True)
+        self.settings_canvas = tk.Canvas(scroll_host, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(
+            scroll_host,
+            orient="vertical",
+            command=self.settings_canvas.yview,
+        )
+        self.settings_canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.settings_canvas.pack(side="left", fill="both", expand=True)
+
+        outer = ttk.Frame(self.settings_canvas, padding=12)
+        self.settings_window = self.settings_canvas.create_window(
+            (0, 0),
+            window=outer,
+            anchor="nw",
+        )
+        outer.bind(
+            "<Configure>",
+            lambda _event: self.settings_canvas.configure(
+                scrollregion=self.settings_canvas.bbox("all")
+            ),
+        )
+        self.settings_canvas.bind(
+            "<Configure>",
+            lambda event: self.settings_canvas.itemconfigure(
+                self.settings_window,
+                width=event.width,
+            ),
+        )
+        self.root.bind("<MouseWheel>", self.on_mousewheel)
 
         status = ttk.LabelFrame(outer, text="Status", padding=10)
         status.pack(fill="x")
@@ -686,6 +1046,12 @@ class VosApp:
         ttk.Label(status, text="Auto alignment:").grid(row=6, column=0, sticky="w")
         self.auto_align_status = ttk.Label(status, text="Off")
         self.auto_align_status.grid(row=6, column=1, sticky="w", padx=10)
+        ttk.Label(status, text="Yeti gate:").grid(row=7, column=0, sticky="w")
+        self.yeti_status = ttk.Label(status, text="Off")
+        self.yeti_status.grid(row=7, column=1, sticky="w", padx=10)
+        ttk.Label(status, text="Thorns buff:").grid(row=8, column=0, sticky="w")
+        self.thorns_status = ttk.Label(status, text="Off")
+        self.thorns_status.grid(row=8, column=1, sticky="w", padx=10)
 
         vos = ttk.LabelFrame(outer, text="VoS Spam", padding=10)
         vos.pack(fill="x", pady=(10, 0))
@@ -709,6 +1075,51 @@ class VosApp:
         self.interval.insert(0, str(self.config["vos_interval"]))
         self.interval.grid(row=4, column=1, sticky="w")
         ttk.Button(vos, text="Toggle VoS now", command=self.toggle_vos).grid(row=5, column=0, pady=(8, 0), sticky="w")
+        self.yeti_required = tk.BooleanVar(value=bool(self.config["yeti_required"]))
+        ttk.Checkbutton(
+            vos,
+            text="Only spam while yeti.png is detected",
+            variable=self.yeti_required,
+            command=self.on_yeti_required_changed,
+        ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        ttk.Label(vos, text="Yeti checks per second:").grid(row=7, column=0, sticky="w", pady=5)
+        self.yeti_check_rate = ttk.Entry(vos, width=14)
+        self.yeti_check_rate.insert(0, str(self.config["yeti_checks_per_second"]))
+        self.yeti_check_rate.grid(row=7, column=1, sticky="w")
+        ttk.Label(vos, text="Yeti match threshold:").grid(row=8, column=0, sticky="w", pady=5)
+        self.yeti_threshold = ttk.Entry(vos, width=14)
+        self.yeti_threshold.insert(0, str(self.config["yeti_match_threshold"]))
+        self.yeti_threshold.grid(row=8, column=1, sticky="w")
+
+        buff = ttk.LabelFrame(outer, text="Thorns Buff", padding=10)
+        buff.pack(fill="x", pady=(10, 0))
+        self.buff_enabled = tk.BooleanVar(value=bool(self.config["buff_enabled"]))
+        ttk.Checkbutton(
+            buff,
+            text="Maintain Thorns before continuing spam",
+            variable=self.buff_enabled,
+            command=self.on_buff_enabled_changed,
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(buff, text="Buff key:").grid(row=1, column=0, sticky="w", pady=5)
+        self.buff_key = ttk.Combobox(buff, values=SPAM_KEYS, state="readonly", width=12)
+        self.buff_key.set(normalize_output_key(self.config["buff_key"]))
+        self.buff_key.grid(row=1, column=1, sticky="w")
+        ttk.Label(buff, text="Buff key hold (seconds):").grid(row=2, column=0, sticky="w", pady=5)
+        self.buff_hold = ttk.Entry(buff, width=14)
+        self.buff_hold.insert(0, str(self.config["buff_key_hold"]))
+        self.buff_hold.grid(row=2, column=1, sticky="w")
+        ttk.Label(buff, text="Wait after buff (seconds):").grid(row=3, column=0, sticky="w", pady=5)
+        self.buff_wait = ttk.Entry(buff, width=14)
+        self.buff_wait.insert(0, str(self.config["buff_wait_seconds"]))
+        self.buff_wait.grid(row=3, column=1, sticky="w")
+        ttk.Label(buff, text="Checks per second:").grid(row=4, column=0, sticky="w", pady=5)
+        self.thorns_check_rate = ttk.Entry(buff, width=14)
+        self.thorns_check_rate.insert(0, str(self.config["thorns_checks_per_second"]))
+        self.thorns_check_rate.grid(row=4, column=1, sticky="w")
+        ttk.Label(buff, text="Thorns match threshold:").grid(row=5, column=0, sticky="w", pady=5)
+        self.thorns_threshold = ttk.Entry(buff, width=14)
+        self.thorns_threshold.insert(0, str(self.config["thorns_match_threshold"]))
+        self.thorns_threshold.grid(row=5, column=1, sticky="w")
 
         checker = ttk.LabelFrame(outer, text="VoS Map Checker", padding=10)
         checker.pack(fill="x", pady=(10, 0))
@@ -764,6 +1175,92 @@ class VosApp:
         self.auto_align_interval = ttk.Entry(overlay, width=14)
         self.auto_align_interval.insert(0, str(self.config["auto_align_interval"]))
         self.auto_align_interval.grid(row=6, column=1, sticky="w")
+        self.show_spammer_overlay = tk.BooleanVar(value=bool(self.config["show_spammer_overlay"]))
+        ttk.Checkbutton(
+            overlay,
+            text="Show spam overlay (ON / OFF / WAITING)",
+            variable=self.show_spammer_overlay,
+            command=self.on_spammer_overlay_changed,
+        ).grid(row=7, column=0, columnspan=2, sticky="w", pady=(7, 0))
+        self.show_crystal = tk.BooleanVar(value=bool(self.config["show_crystal"]))
+        ttk.Checkbutton(
+            overlay,
+            text="Show crystal (red vertical guide while detected)",
+            variable=self.show_crystal,
+            command=self.on_show_crystal_changed,
+        ).grid(row=8, column=0, columnspan=2, sticky="w")
+        self.loot_crystal = tk.BooleanVar(value=bool(self.config["loot_crystal"]))
+        ttk.Checkbutton(
+            overlay,
+            text="Loot crystal (temporarily prioritize red line)",
+            variable=self.loot_crystal,
+            command=self.on_loot_crystal_changed,
+        ).grid(row=9, column=0, columnspan=2, sticky="w")
+        ttk.Separator(overlay, orient="horizontal").grid(
+            row=10, column=0, columnspan=2, sticky="ew", pady=8
+        )
+        ttk.Label(overlay, text="Normal green target:").grid(row=11, column=0, sticky="w")
+        self.alignment_target_mode = tk.StringVar(
+            value=str(self.config.get("alignment_target_mode", "area"))
+        )
+        target_choices = ttk.Frame(overlay)
+        target_choices.grid(row=11, column=1, sticky="w")
+        ttk.Radiobutton(
+            target_choices,
+            text="Area image",
+            value="area",
+            variable=self.alignment_target_mode,
+            command=self.on_alignment_target_changed,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            target_choices,
+            text="Manual anchor",
+            value="manual",
+            variable=self.alignment_target_mode,
+            command=self.on_alignment_target_changed,
+        ).pack(side="left", padx=(8, 0))
+        self.manual_anchor_offset = tk.IntVar(
+            value=int(self.config.get("manual_anchor_offset", 0))
+        )
+        self.manual_anchor_label = ttk.Label(overlay, text="")
+        self.manual_anchor_label.grid(row=12, column=0, sticky="w", pady=5)
+        ttk.Scale(
+            overlay,
+            from_=-1000,
+            to=1000,
+            orient="horizontal",
+            variable=self.manual_anchor_offset,
+            command=self.on_manual_anchor_moved,
+        ).grid(row=12, column=1, sticky="ew", pady=5)
+        overlay.columnconfigure(1, weight=1)
+        self.update_manual_anchor_label()
+        self.spam_overlay_x = tk.IntVar(
+            value=int(self.config.get("spam_overlay_x_percent", 85))
+        )
+        self.spam_overlay_y = tk.IntVar(
+            value=int(self.config.get("spam_overlay_y_percent", 5))
+        )
+        self.spam_overlay_x_label = ttk.Label(overlay, text="")
+        self.spam_overlay_x_label.grid(row=13, column=0, sticky="w", pady=5)
+        ttk.Scale(
+            overlay,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            variable=self.spam_overlay_x,
+            command=lambda value: self.on_spam_overlay_position_changed("x", value),
+        ).grid(row=13, column=1, sticky="ew", pady=5)
+        self.spam_overlay_y_label = ttk.Label(overlay, text="")
+        self.spam_overlay_y_label.grid(row=14, column=0, sticky="w", pady=5)
+        ttk.Scale(
+            overlay,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            variable=self.spam_overlay_y,
+            command=lambda value: self.on_spam_overlay_position_changed("y", value),
+        ).grid(row=14, column=1, sticky="ew", pady=5)
+        self.update_spam_overlay_position_labels()
 
         settings = ttk.LabelFrame(outer, text="General / Arduino", padding=10)
         settings.pack(fill="x", pady=(10, 0))
@@ -791,6 +1288,13 @@ class VosApp:
         self.log_view = tk.Text(logs, height=8, state="disabled", wrap="word")
         self.log_view.pack(fill="both", expand=True)
 
+    def on_mousewheel(self, event):
+        if not hasattr(self, "settings_canvas"):
+            return
+        delta = int(getattr(event, "delta", 0))
+        if delta:
+            self.settings_canvas.yview_scroll(-1 if delta > 0 else 1, "units")
+
     def read_form(self):
         hold = float(self.hold.get())
         interval = float(self.interval.get())
@@ -802,6 +1306,12 @@ class VosApp:
         auto_align_tolerance = int(self.auto_align_tolerance.get())
         auto_align_hold = float(self.auto_align_hold.get())
         auto_align_interval = float(self.auto_align_interval.get())
+        yeti_rate = float(self.yeti_check_rate.get())
+        yeti_threshold = float(self.yeti_threshold.get())
+        buff_hold = float(self.buff_hold.get())
+        buff_wait = float(self.buff_wait.get())
+        thorns_rate = float(self.thorns_check_rate.get())
+        thorns_threshold = float(self.thorns_threshold.get())
         if hold < 0 or interval <= 0 or baud <= 0:
             raise ValueError("Hold must be >= 0; interval and baud rate must be > 0.")
         if not 1 <= check_rate <= 100:
@@ -818,6 +1328,18 @@ class VosApp:
             raise ValueError("Movement key hold must be between 0.001 and 1 second.")
         if not 0.02 <= auto_align_interval <= 5.0:
             raise ValueError("Correction interval must be between 0.02 and 5 seconds.")
+        if not 1 <= yeti_rate <= 100:
+            raise ValueError("Yeti checks per second must be between 1 and 100.")
+        if not 0.5 <= yeti_threshold <= 0.9999:
+            raise ValueError("Yeti match threshold must be between 0.5 and 0.9999.")
+        if not 0.001 <= buff_hold <= 1.0:
+            raise ValueError("Buff key hold must be between 0.001 and 1 second.")
+        if not 0 <= buff_wait <= 60:
+            raise ValueError("Buff wait must be between 0 and 60 seconds.")
+        if not 1 <= thorns_rate <= 100:
+            raise ValueError("Thorns checks per second must be between 1 and 100.")
+        if not 0.5 <= thorns_threshold <= 0.9999:
+            raise ValueError("Thorns match threshold must be between 0.5 and 0.9999.")
         master_key = self.master_key.get().strip() or "F11"
         vos_key = self.vos_toggle_key.get().strip() or "F10"
         if master_key.lower() == vos_key.lower():
@@ -840,6 +1362,22 @@ class VosApp:
             "auto_align_tolerance_pixels": auto_align_tolerance,
             "auto_align_key_hold": auto_align_hold,
             "auto_align_interval": auto_align_interval,
+            "show_spammer_overlay": bool(self.show_spammer_overlay.get()),
+            "spam_overlay_x_percent": int(self.spam_overlay_x.get()),
+            "spam_overlay_y_percent": int(self.spam_overlay_y.get()),
+            "show_crystal": bool(self.show_crystal.get()),
+            "loot_crystal": bool(self.loot_crystal.get()),
+            "alignment_target_mode": self.alignment_target_mode.get(),
+            "manual_anchor_offset": int(self.manual_anchor_offset.get()),
+            "yeti_required": bool(self.yeti_required.get()),
+            "yeti_checks_per_second": yeti_rate,
+            "yeti_match_threshold": yeti_threshold,
+            "buff_enabled": bool(self.buff_enabled.get()),
+            "buff_key": normalize_output_key(self.buff_key.get()),
+            "buff_key_hold": buff_hold,
+            "buff_wait_seconds": buff_wait,
+            "thorns_checks_per_second": thorns_rate,
+            "thorns_match_threshold": thorns_threshold,
             "use_arduino": bool(self.use_arduino.get()),
             "auto_detect_arduino": bool(self.auto_detect.get()),
             "serial_port": self.serial_port.get().strip() or "COM3",
@@ -915,6 +1453,26 @@ class VosApp:
             self.stop_vos("function disabled")
         save_config(self.config)
 
+    def on_yeti_required_changed(self):
+        enabled = bool(self.yeti_required.get())
+        self.config["yeti_required"] = enabled
+        if not enabled:
+            self.spam_paused_reason = None
+        save_config(self.config)
+        log(f"Yeti-required spam gate {'enabled' if enabled else 'disabled'}")
+
+    def on_buff_enabled_changed(self):
+        enabled = bool(self.buff_enabled.get())
+        self.config["buff_enabled"] = enabled
+        self.buff_resume_not_before = 0.0
+        if not enabled and self.spam_paused_reason and (
+            self.spam_paused_reason == "Casting Thorns"
+            or self.spam_paused_reason.startswith("Waiting for Thorns")
+        ):
+            self.spam_paused_reason = None
+        save_config(self.config)
+        log(f"Thorns buff maintenance {'enabled' if enabled else 'disabled'}")
+
     def on_map_checker_changed(self):
         enabled = bool(self.map_checker_enabled.get())
         self.config["vos_map_checker_enabled"] = enabled
@@ -937,6 +1495,85 @@ class VosApp:
             self.auto_align_delta = None
         save_config(self.config)
         log(f"Auto alignment {'enabled' if enabled else 'disabled'}")
+
+    def on_spammer_overlay_changed(self):
+        enabled = bool(self.show_spammer_overlay.get())
+        self.config["show_spammer_overlay"] = enabled
+        save_config(self.config)
+        log(f"In-game spammer badge {'enabled' if enabled else 'disabled'}")
+
+    def update_spam_overlay_position_labels(self):
+        if hasattr(self, "spam_overlay_x_label"):
+            self.spam_overlay_x_label.configure(
+                text=f"Badge horizontal: {int(self.spam_overlay_x.get())}%"
+            )
+        if hasattr(self, "spam_overlay_y_label"):
+            self.spam_overlay_y_label.configure(
+                text=f"Badge vertical: {int(self.spam_overlay_y.get())}%"
+            )
+
+    def on_spam_overlay_position_changed(self, axis, value):
+        position = max(0, min(100, int(round(float(value)))))
+        if axis == "x":
+            self.spam_overlay_x.set(position)
+            self.config["spam_overlay_x_percent"] = position
+        else:
+            self.spam_overlay_y.set(position)
+            self.config["spam_overlay_y_percent"] = position
+        self.update_spam_overlay_position_labels()
+        if self._overlay_position_save_job is not None:
+            self.root.after_cancel(self._overlay_position_save_job)
+        self._overlay_position_save_job = self.root.after(
+            300,
+            self.save_spam_overlay_position,
+        )
+
+    def save_spam_overlay_position(self):
+        self._overlay_position_save_job = None
+        save_config(self.config)
+
+    def on_show_crystal_changed(self):
+        enabled = bool(self.show_crystal.get())
+        self.config["show_crystal"] = enabled
+        if not enabled and self.alignment_overlay is not None:
+            self.alignment_overlay.clear_crystal()
+        save_config(self.config)
+        log(f"Crystal guide {'enabled' if enabled else 'disabled'}")
+
+    def on_loot_crystal_changed(self):
+        enabled = bool(self.loot_crystal.get())
+        self.config["loot_crystal"] = enabled
+        if enabled:
+            self.show_crystal.set(True)
+            self.config["show_crystal"] = True
+        save_config(self.config)
+        log(f"Loot crystal priority {'enabled' if enabled else 'disabled'}")
+
+    def on_alignment_target_changed(self):
+        mode = self.alignment_target_mode.get()
+        self.config["alignment_target_mode"] = "manual" if mode == "manual" else "area"
+        save_config(self.config)
+        log(
+            "Normal alignment target changed to "
+            + ("manual screen anchor" if mode == "manual" else "area.png")
+        )
+
+    def update_manual_anchor_label(self):
+        offset = int(self.manual_anchor_offset.get())
+        self.manual_anchor_label.configure(text=f"Anchor offset: {offset:+d}px (0 = center)")
+
+    def on_manual_anchor_moved(self, value):
+        offset = int(round(float(value)))
+        self.manual_anchor_offset.set(offset)
+        self.config["manual_anchor_offset"] = offset
+        self.update_manual_anchor_label()
+        if self._anchor_save_job is not None:
+            self.root.after_cancel(self._anchor_save_job)
+        self._anchor_save_job = self.root.after(300, self.save_manual_anchor)
+
+    def save_manual_anchor(self):
+        self._anchor_save_job = None
+        save_config(self.config)
 
     def start_auto_align_controller(self):
         if self.auto_align_thread is not None and self.auto_align_thread.is_alive():
@@ -962,26 +1599,66 @@ class VosApp:
                 self.auto_align_delta = None
                 self.auto_align_stop.wait(0.10)
                 continue
+            # The Yeti gate controls only skill spam. Movement alignment should
+            # continue while waiting for a Yeti. Other maintenance pauses,
+            # such as casting/recovering Thorns, still pause movement.
+            if self.spam_paused_reason and self.spam_paused_reason != "Waiting for yeti":
+                self.auto_align_direction = self.spam_paused_reason
+                self.auto_align_delta = None
+                self.auto_align_stop.wait(0.10)
+                continue
 
-            _, _, bulb, area, _, _, checked = self.alignment_overlay.snapshot()
+            (
+                _,
+                client_bbox,
+                bulb,
+                area,
+                _,
+                _,
+                checked,
+                crystal,
+                _,
+                _,
+            ) = self.alignment_overlay.snapshot()
             detector_rate = max(1.0, float(self.config.get("alignment_checks_per_second", 10)))
             if (
                 bulb is None
-                or area is None
                 or time.monotonic() - checked > max(0.5, 3.0 / detector_rate)
             ):
-                self.auto_align_direction = "Waiting for both markers"
+                self.auto_align_direction = "Waiting for character marker"
                 self.auto_align_delta = None
                 self.auto_align_stop.wait(interval)
                 continue
 
+            loot_pending = bool(
+                self.config.get("loot_crystal", False) and crystal is not None
+            )
             character_x = bulb[0] + bulb[2] / 2.0
-            target_x = area[0] + area[2] / 2.0
+            if loot_pending:
+                target_name = "Crystal"
+                target_x = crystal[0] + crystal[2] / 2.0
+            elif self.config.get("alignment_target_mode", "area") == "manual":
+                target_name = "Manual anchor"
+                client_width = client_bbox[2] - client_bbox[0]
+                offset = int(self.config.get("manual_anchor_offset", 0))
+                target_x = max(0, min(client_width - 1, client_width / 2.0 + offset))
+            elif area is not None:
+                target_name = "Area"
+                target_x = area[0] + area[2] / 2.0
+            else:
+                self.auto_align_direction = "Waiting for area marker"
+                self.auto_align_delta = None
+                self.auto_align_stop.wait(interval)
+                continue
+
             delta = character_x - target_x
             tolerance = max(0, int(self.config.get("auto_align_tolerance_pixels", 8)))
             self.auto_align_delta = delta
             if abs(delta) <= tolerance:
-                self.auto_align_direction = "Aligned"
+                if loot_pending:
+                    self.auto_align_direction = "Crystal reached; waiting for pickup"
+                else:
+                    self.auto_align_direction = "Aligned"
                 self.auto_align_stop.wait(interval)
                 continue
 
@@ -994,7 +1671,7 @@ class VosApp:
                 sent = True
 
             if sent:
-                self.auto_align_direction = direction
+                self.auto_align_direction = f"{target_name} {direction}"
                 self.auto_align_move_count += 1
             else:
                 self.auto_align_direction = "Arduino send failed"
@@ -1027,6 +1704,8 @@ class VosApp:
             return
         self.stop_event.clear()
         self.send_count = 0
+        self.spam_paused_reason = None
+        self.buff_resume_not_before = 0.0
         self.spam_active = True
         self.worker = threading.Thread(target=self._spam_loop, name="vos-spam", daemon=True)
         self.worker.start()
@@ -1036,6 +1715,8 @@ class VosApp:
         was_active = self.spam_active
         self.stop_event.set()
         self.spam_active = False
+        self.spam_paused_reason = None
+        self.buff_resume_not_before = 0.0
         if was_active:
             log(f"VoS spam OFF ({reason})")
 
@@ -1051,6 +1732,39 @@ class VosApp:
             if not self.map_detector.allows_spam():
                 self.stop_vos("VoS map not detected")
                 return
+            if self.config.get("buff_enabled", False):
+                now = time.monotonic()
+                if now < self.buff_resume_not_before:
+                    remaining = self.buff_resume_not_before - now
+                    self.spam_paused_reason = f"Waiting for Thorns ({remaining:.1f}s)"
+                    if self.stop_event.wait(min(0.05, remaining)):
+                        break
+                    continue
+                if not self.thorns_detector.allows_spam():
+                    self.spam_paused_reason = "Casting Thorns"
+                    buff_key = normalize_output_key(self.config.get("buff_key", "END"))
+                    buff_hold = max(0.001, float(self.config.get("buff_key_hold", 0.03)))
+                    if self.config.get("use_arduino", True):
+                        sent = ARDUINO.send_key(self.config, buff_key, buff_hold)
+                    else:
+                        send_windows_key(buff_key, buff_hold)
+                        sent = True
+                    if not sent:
+                        self.stop_vos("Thorns buff key send failed")
+                        return
+                    wait_seconds = max(0.0, float(self.config.get("buff_wait_seconds", 5.0)))
+                    self.buff_resume_not_before = time.monotonic() + wait_seconds
+                    self.spam_paused_reason = f"Waiting for Thorns ({wait_seconds:.1f}s)"
+                    log(f"Thorns missing: sent {buff_key}, waiting {wait_seconds:.1f}s")
+                    if self.stop_event.wait(min(0.05, max(0.001, wait_seconds))):
+                        break
+                    continue
+            if not self.yeti_detector.allows_spam():
+                self.spam_paused_reason = "Waiting for yeti"
+                if self.stop_event.wait(0.05):
+                    break
+                continue
+            self.spam_paused_reason = None
             if config.get("use_arduino", True):
                 if not ARDUINO.send_key(config, key, hold):
                     log("VoS stopped: Arduino send failed")
@@ -1067,8 +1781,13 @@ class VosApp:
         active = is_dreamms_active()
         self.window_status.configure(text="Active" if active else "Inactive", foreground="green" if active else "red")
         self.master_status.configure(text="On" if self.master_enabled else "Off", foreground="green" if self.master_enabled else "red")
-        vos_text = f"Running ({self.send_count} sent)" if self.spam_active else "Off"
-        self.vos_status.configure(text=vos_text, foreground="green" if self.spam_active else "red")
+        if self.spam_active and self.spam_paused_reason:
+            vos_text, vos_color = f"Waiting for Yeti ({self.send_count} sent)", "orange"
+        elif self.spam_active:
+            vos_text, vos_color = f"Running ({self.send_count} sent)", "green"
+        else:
+            vos_text, vos_color = "Off", "red"
+        self.vos_status.configure(text=vos_text, foreground=vos_color)
         map_matched, map_text, map_score, _ = self.map_detector.snapshot()
         if not self.config.get("vos_map_checker_enabled", True):
             map_color = "gray"
@@ -1077,14 +1796,34 @@ class VosApp:
         score_suffix = f" ({map_score:.2f})" if map_text in {"Matched", "Not detected"} else ""
         self.map_status.configure(text=map_text + score_suffix, foreground=map_color)
         if self.alignment_overlay is not None:
-            overlay_text, _, bulb, area, bulb_score, area_score, _ = self.alignment_overlay.snapshot()
+            (
+                overlay_text,
+                _,
+                bulb,
+                area,
+                bulb_score,
+                area_score,
+                _,
+                crystal,
+                crystal_score,
+                _,
+            ) = self.alignment_overlay.snapshot()
             if not self.config.get("alignment_overlay_enabled", False):
                 overlay_color = "gray"
             else:
-                overlay_color = "green" if bulb is not None and area is not None else "orange"
+                manual_target = self.config.get("alignment_target_mode", "area") == "manual"
+                target_ready = manual_target or area is not None
+                overlay_color = "green" if bulb is not None and target_ready else "orange"
             detail = ""
             if self.config.get("alignment_overlay_enabled", False):
-                detail = f" (bulb {bulb_score:.2f}, area {area_score:.2f})"
+                if self.config.get("alignment_target_mode", "area") == "manual":
+                    offset = int(self.config.get("manual_anchor_offset", 0))
+                    detail = f" (bulb {bulb_score:.2f}, anchor {offset:+d}px)"
+                else:
+                    detail = f" (bulb {bulb_score:.2f}, area {area_score:.2f})"
+            if self.config.get("show_crystal", False):
+                crystal_text = f", crystal {crystal_score:.2f}" if crystal is not None else ", crystal waiting"
+                detail = (detail[:-1] + crystal_text + ")") if detail else f" ({crystal_text[2:]})"
             self.alignment_status.configure(text=overlay_text + detail, foreground=overlay_color)
         if not self.config.get("auto_align_enabled", False):
             auto_text, auto_color = "Off", "gray"
@@ -1093,6 +1832,23 @@ class VosApp:
             auto_text = f"{self.auto_align_direction}{delta_text} ({self.auto_align_move_count} moves)"
             auto_color = "green" if self.auto_align_direction == "Aligned" else "orange"
         self.auto_align_status.configure(text=auto_text, foreground=auto_color)
+        yeti_matched, yeti_text, yeti_score, _ = self.yeti_detector.snapshot()
+        if not self.config.get("yeti_required", False):
+            yeti_color = "gray"
+        else:
+            yeti_color = "green" if yeti_matched else "orange"
+        yeti_suffix = f" ({yeti_score:.2f})" if yeti_text in {"Detected", "Not detected"} else ""
+        self.yeti_status.configure(text=yeti_text + yeti_suffix, foreground=yeti_color)
+        thorns_matched, thorns_text, thorns_score, _, _ = self.thorns_detector.snapshot()
+        if not self.config.get("buff_enabled", False):
+            thorns_color = "gray"
+        else:
+            thorns_color = "green" if thorns_matched else "orange"
+        thorns_suffix = f" ({thorns_score:.2f})" if thorns_text in {"Active", "Missing"} else ""
+        self.thorns_status.configure(
+            text=thorns_text + thorns_suffix,
+            foreground=thorns_color,
+        )
 
         if not self.config.get("use_arduino", True):
             arduino_text, color = "Off (Windows fallback)", "gray"
@@ -1114,6 +1870,8 @@ class VosApp:
     def on_close(self):
         self.stop_vos("application closing")
         self.map_detector.stop()
+        self.yeti_detector.stop()
+        self.thorns_detector.stop()
         self.auto_align_stop.set()
         if self.auto_align_thread is not None and self.auto_align_thread.is_alive():
             self.auto_align_thread.join(timeout=1.0)
