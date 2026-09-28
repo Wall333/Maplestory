@@ -56,6 +56,8 @@ class ShopController:
         try:
             with mss.mss() as sct:
                 while not self.stop_event.is_set():
+                    started = time.monotonic()
+                    rate = max(1.0, min(30.0, float(self.app.config.get("inventory_checks_per_second", 5))))
                     if not (self.app.config.get("shop_enabled") or self.app.config.get("inventory_debug") or self.test_cycle):
                         self.status = "Off"
                         self.stop_event.wait(.2)
@@ -103,7 +105,7 @@ class ShopController:
                         self.inventory_rect, self.changed = rect, changed
                         self.checked = time.monotonic()
                     self.status = "Inventory changed" if changed else ("Inventory clean" if rect else "Inventory not detected")
-                    self.stop_event.wait(.2)
+                    self.stop_event.wait(max(0.0, 1.0 / rate - (time.monotonic() - started)))
         except Exception as exc:
             self.status = "Detector error: " + str(exc)
 
@@ -130,15 +132,17 @@ class ShopController:
         with self.lock:
             context, changed, checked = self.context, self.changed, self.checked
             matches = dict(self.matches)
+        rate = max(1.0, min(30.0, float(self.app.config.get("inventory_checks_per_second", 5))))
+        max_age = max(.6, 2.0 / rate)
         if self.state == "idle":
-            if not changed or context is None or time.monotonic() - checked > .6:
+            if not changed or context is None or time.monotonic() - checked > max_age:
                 return False
             self.state = "open"
             self.api["log"]("Selling: inventory changed; opening shop")
         self.app.spam_paused_reason = "Selling: " + self.state
         if self.app.stop_event.is_set() or self.api["get_active_dreamms_context"]() != context:
             return True
-        if context is None or time.monotonic() - checked > .6 or time.monotonic() < self.next_action:
+        if context is None or time.monotonic() - checked > max_age or time.monotonic() < self.next_action:
             return True
         target = None
         if self.state == "open":

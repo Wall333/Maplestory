@@ -52,6 +52,8 @@ LIGHTBULB_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "lightbulb.png")
 CRYSTAL_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "crystal.png")
 YETI_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "yeti.png")
 YETI2_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "yeti2.png")
+CROWN_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "crown.png")
+CROWN2_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "crown2.png")
 THORNS_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "thorns.png")
 
 DEFAULTS = {
@@ -62,6 +64,7 @@ DEFAULTS = {
     "shop_match_threshold": 0.9,
     "inventory_match_threshold": 0.97,
     "inventory_detection_threshold": 0.9,
+    "inventory_checks_per_second": 5,
     "enabled": True,
     "toggle_key": "F11",
     "vos_enabled": True,
@@ -426,7 +429,7 @@ class VosMapDetector:
 
 
 class YetiDetector:
-    """Presence gate accepting either Yeti template."""
+    """Presence gate accepting Yeti or Crown templates."""
 
     def __init__(self, app):
         self.app = app
@@ -475,13 +478,15 @@ class YetiDetector:
             self.last_check = time.monotonic()
             self.match_rects = list(rects or []) if matched else []
         if changed and status in {"Detected", "Not detected"}:
-            log(f"Yeti Gate: {status} | match={score:.3f}")
+            log(f"Yeti/Crown Gate: {status} | match={score:.3f}")
 
     def _loop(self):
         if cv2 is None or mss is None or np is None:
             self._set_state(False, "Missing vision dependencies")
             return
-        templates = [cv2.imread(path, cv2.IMREAD_COLOR) for path in (YETI_TEMPLATE_PATH, YETI2_TEMPLATE_PATH)]
+        templates = [cv2.imread(path, cv2.IMREAD_COLOR) for path in (
+            YETI_TEMPLATE_PATH, YETI2_TEMPLATE_PATH, CROWN_TEMPLATE_PATH, CROWN2_TEMPLATE_PATH
+        )]
         templates = [template for template in templates if template is not None and template.size]
         if not templates:
             self._set_state(False, "Template missing")
@@ -1087,7 +1092,7 @@ class VosApp:
         ttk.Label(status, text="Auto alignment:").grid(row=6, column=0, sticky="w")
         self.auto_align_status = ttk.Label(status, text="Off")
         self.auto_align_status.grid(row=6, column=1, sticky="w", padx=10)
-        ttk.Label(status, text="Yeti gate:").grid(row=7, column=0, sticky="w")
+        ttk.Label(status, text="Yeti/Crown gate:").grid(row=7, column=0, sticky="w")
         self.yeti_status = ttk.Label(status, text="Off")
         self.yeti_status.grid(row=7, column=1, sticky="w", padx=10)
         ttk.Label(status, text="Thorns buff:").grid(row=8, column=0, sticky="w")
@@ -1118,6 +1123,10 @@ class VosApp:
         self.shop_test_key = ttk.Entry(shop, width=14)
         self.shop_test_key.insert(0, self.config["shop_test_key"])
         self.shop_test_key.pack(anchor="w")
+        ttk.Label(shop, text="Inventory checks per second:").pack(anchor="w", pady=(6, 0))
+        self.inventory_check_rate = ttk.Entry(shop, width=14)
+        self.inventory_check_rate.insert(0, str(self.config["inventory_checks_per_second"]))
+        self.inventory_check_rate.pack(anchor="w")
         ttk.Label(shop, text="Inventory detection threshold (header):").pack(anchor="w", pady=(6, 0))
         self.inventory_detection_threshold = ttk.Entry(shop, width=14)
         self.inventory_detection_threshold.insert(0, str(self.config["inventory_detection_threshold"]))
@@ -1157,15 +1166,15 @@ class VosApp:
         self.yeti_required = tk.BooleanVar(value=bool(self.config["yeti_required"]))
         ttk.Checkbutton(
             vos,
-            text="Only spam while yeti.png is detected",
+            text="Only spam while Yeti or Crown is detected",
             variable=self.yeti_required,
             command=self.on_yeti_required_changed,
         ).grid(row=6, column=0, columnspan=2, sticky="w", pady=(7, 0))
-        ttk.Label(vos, text="Yeti checks per second:").grid(row=7, column=0, sticky="w", pady=5)
+        ttk.Label(vos, text="Yeti/Crown checks per second:").grid(row=7, column=0, sticky="w", pady=5)
         self.yeti_check_rate = ttk.Entry(vos, width=14)
         self.yeti_check_rate.insert(0, str(self.config["yeti_checks_per_second"]))
         self.yeti_check_rate.grid(row=7, column=1, sticky="w")
-        ttk.Label(vos, text="Yeti match threshold:").grid(row=8, column=0, sticky="w", pady=5)
+        ttk.Label(vos, text="Yeti/Crown match threshold:").grid(row=8, column=0, sticky="w", pady=5)
         self.yeti_threshold = ttk.Entry(vos, width=14)
         self.yeti_threshold.insert(0, str(self.config["yeti_match_threshold"]))
         self.yeti_threshold.grid(row=8, column=1, sticky="w")
@@ -1173,7 +1182,7 @@ class VosApp:
         def update_yeti_overlay():
             self.config["show_yeti_overlay"] = self.show_yeti_overlay.get()
             save_config(self.config)
-        ttk.Checkbutton(vos, text="Draw box around detected Yeti", variable=self.show_yeti_overlay,
+        ttk.Checkbutton(vos, text="Draw box around detected Yeti/Crown", variable=self.show_yeti_overlay,
                         command=update_yeti_overlay).grid(row=9, column=0, columnspan=2, sticky="w")
 
         buff = ttk.LabelFrame(outer, text="Thorns Buff", padding=10)
@@ -1381,6 +1390,9 @@ class VosApp:
             self.settings_canvas.yview_scroll(-1 if delta > 0 else 1, "units")
 
     def read_form(self):
+        inventory_rate = float(self.inventory_check_rate.get())
+        if not 1 <= inventory_rate <= 30:
+            raise ValueError("Inventory checks per second must be between 1 and 30.")
         shop_thresholds = {
             "inventory_detection_threshold": float(self.inventory_detection_threshold.get()),
             "inventory_match_threshold": float(self.inventory_match_threshold.get()),
@@ -1393,6 +1405,7 @@ class VosApp:
         if test_key.lower() in {self.master_key.get().strip().lower(), self.vos_toggle_key.get().strip().lower()}:
             raise ValueError("Shop test hotkey must differ from master and VoS hotkeys.")
         self.config["shop_test_key"] = test_key
+        self.config["inventory_checks_per_second"] = inventory_rate
         self.config.update(shop_thresholds)
         hold = float(self.hold.get())
         interval = float(self.interval.get())
@@ -1596,7 +1609,7 @@ class VosApp:
         if not enabled:
             self.spam_paused_reason = None
         save_config(self.config)
-        log(f"Yeti-required spam gate {'enabled' if enabled else 'disabled'}")
+        log(f"Yeti/Crown-required spam gate {'enabled' if enabled else 'disabled'}")
 
     def on_buff_enabled_changed(self):
         enabled = bool(self.buff_enabled.get())
@@ -1740,10 +1753,10 @@ class VosApp:
                 self.auto_align_direction = "Selling"
                 self.auto_align_stop.wait(.1)
                 continue
-            # The Yeti gate controls only skill spam. Movement alignment should
-            # continue while waiting for a Yeti. Other maintenance pauses,
+            # The Yeti/Crown gate controls only skill spam. Movement alignment should
+            # continue while waiting for either template. Other maintenance pauses,
             # such as casting/recovering Thorns, still pause movement.
-            if self.spam_paused_reason and self.spam_paused_reason != "Waiting for yeti":
+            if self.spam_paused_reason and self.spam_paused_reason != "Waiting for Yeti/Crown":
                 self.auto_align_direction = self.spam_paused_reason
                 self.auto_align_delta = None
                 self.auto_align_stop.wait(0.10)
@@ -1911,7 +1924,7 @@ class VosApp:
                         break
                     continue
             if not self.yeti_detector.allows_spam():
-                self.spam_paused_reason = "Waiting for yeti"
+                self.spam_paused_reason = "Waiting for Yeti/Crown"
                 if self.stop_event.wait(0.05):
                     break
                 continue

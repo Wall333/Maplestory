@@ -57,14 +57,15 @@ The spam status overlay can be shown or hidden independently. Horizontal and
 vertical position sliders move it live using percentages of the DreamMS client,
 and the selected position is saved automatically.
 
-The optional **Yeti required** gate checks for `assets/yeti.png` or `assets/yeti2.png`. With the gate
-enabled, only skill spam pauses while the Yeti is absent, then resumes
-automatically when it is detected. Auto-alignment continues moving during this
+The optional **Yeti/Crown required** gate checks for `assets/yeti.png`, `assets/yeti2.png`,
+`assets/crown.png`, or `assets/crown2.png`. With the gate enabled, only skill spam
+pauses while all four are absent, then resumes when any one is detected.
+Auto-alignment continues moving during this
 wait. The GUI and in-game badge distinguish the waiting state from ON/OFF.
 
-Enable **Draw box around detected Yeti** to show an orange outline at the best
-match for each Yeti template. This debug display works independently of the
-Yeti-required spam gate and uses the same Yeti threshold.
+Enable **Draw box around detected Yeti/Crown** to show an orange outline at the
+best match for each of the four templates. This debug display works independently
+of the spam gate and uses the same Yeti/Crown threshold.
 
 Optional Thorns maintenance checks `assets/thorns.png` with its own detection
 rate and threshold. If the icon is missing during an active spam session, spam
@@ -79,6 +80,10 @@ Automatic selling is optional. Enable the inventory debug box first and show
 the inventory window: green indicates the clean grid and red indicates a
 changed grid. Selling triggers on any detected grid change, not a count of full
 slots. The inventory header must remain visible for this comparison.
+
+The inventory check rate is adjustable from 1 to 30 checks per second (default 5).
+This controls how often the inventory debug box and selling image checks update;
+higher rates use more CPU. Enter a rate and save settings to apply it.
 
 Inventory-triggered automatic selling requires VoS spam to be ON. The enabled
 F8 shop test can still run one cycle with spam OFF. DreamMS must be foreground.
