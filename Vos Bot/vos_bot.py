@@ -49,6 +49,7 @@ LOG_PATH = os.path.join(BASE_DIR, "recent_logs.txt")
 VOS_MAP_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "VOS_map.png")
 AREA_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "area.png")
 LIGHTBULB_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "lightbulb.png")
+ARROW_TRACKER_PATH = os.path.join(BASE_DIR, "assets", "tracker.png")
 CRYSTAL_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "crystal.png")
 YETI_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "yeti.png")
 YETI2_TEMPLATE_PATH = os.path.join(BASE_DIR, "assets", "yeti2.png")
@@ -65,6 +66,8 @@ DEFAULTS = {
     "inventory_match_threshold": 0.97,
     "inventory_detection_threshold": 0.9,
     "inventory_checks_per_second": 5,
+    "shop_open_checks_per_second": 1,
+    "shop_open_auto_sell": True,
     "enabled": True,
     "toggle_key": "F11",
     "vos_enabled": True,
@@ -78,6 +81,9 @@ DEFAULTS = {
     "alignment_overlay_enabled": True,
     "alignment_checks_per_second": 10,
     "alignment_match_threshold": 0.70,
+    "character_tracker_mode": "lightbulb",
+    "arrow_match_threshold": 0.60,
+    "log_panel_height": 130,
     "alignment_target_mode": "manual",
     "manual_anchor_offset": 0,
     "auto_align_enabled": True,
@@ -97,7 +103,7 @@ DEFAULTS = {
     "buff_key": "END",
     "buff_key_hold": 0.03,
     "buff_wait_seconds": 5.0,
-    "thorns_checks_per_second": 10,
+    "thorns_checks_per_second": 2,
     "thorns_match_threshold": 0.50,
     "use_arduino": True,
     "auto_detect_arduino": True,
@@ -558,7 +564,7 @@ class ThornsDetector:
         if not self.app.config.get("buff_enabled", False):
             return True
         matched, _, _, checked, _ = self.snapshot()
-        rate = max(1.0, float(self.app.config.get("thorns_checks_per_second", 10)))
+        rate = max(1.0, float(self.app.config.get("thorns_checks_per_second", 2)))
         return matched and time.monotonic() - checked <= max(0.5, 3.0 / rate)
 
     def _set_state(self, matched, status, score=0.0, match_rect=None):
@@ -586,7 +592,7 @@ class ThornsDetector:
                 while not self.stop_event.is_set():
                     started = time.monotonic()
                     enabled = bool(self.app.config.get("buff_enabled", False))
-                    rate = max(1.0, min(100.0, float(self.app.config.get("thorns_checks_per_second", 10))))
+                    rate = max(1.0, min(100.0, float(self.app.config.get("thorns_checks_per_second", 2))))
                     threshold = max(0.5, min(0.9999, float(self.app.config.get("thorns_match_threshold", 0.85))))
                     if not enabled:
                         self._set_state(True, "Off", 1.0)
@@ -621,7 +627,7 @@ class ThornsDetector:
 
 
 class AlignmentOverlay:
-    """Find the light bulb and target area and draw click-through guides."""
+    """Find the selected character marker and target area and draw guides."""
 
     TRANSPARENT_COLOR = "#ff00ff"
 
@@ -777,6 +783,7 @@ class AlignmentOverlay:
         if bulb is None or area is None or crystal is None:
             self._set_results("Overlay template missing")
             return
+        arrow_tracker = None
         try:
             with mss.mss() as sct:
                 while not self.stop_event.is_set():
@@ -800,7 +807,16 @@ class AlignmentOverlay:
                             self._set_results("Game inactive")
                         else:
                             frame = VosMapDetector._capture(sct, context[1])
-                            bulb_match, bulb_score = self._best_match(frame, bulb, threshold)
+                            arrow_mode = self.app.config.get("character_tracker_mode", "lightbulb") == "arrows"
+                            if arrow_mode:
+                                if arrow_tracker is None:
+                                    from arrow_tracker import ArrowShapeTracker
+                                    arrow_tracker = ArrowShapeTracker(ARROW_TRACKER_PATH)
+                                arrow_threshold = max(0.3, min(0.95, float(
+                                    self.app.config.get("arrow_match_threshold", 0.60))))
+                                bulb_match, bulb_score = arrow_tracker.find(frame, arrow_threshold)
+                            else:
+                                bulb_match, bulb_score = self._best_match(frame, bulb, threshold)
                             area_match, area_score = self._best_match(frame, area, threshold)
                             if self.app.config.get("show_crystal", False):
                                 crystal_match, crystal_score = self._best_match(frame, crystal, threshold)
@@ -811,13 +827,13 @@ class AlignmentOverlay:
                             if manual_target and bulb_match:
                                 status = "Character + manual anchor"
                             elif manual_target:
-                                status = "Light bulb not detected"
+                                status = "Character arrows not detected" if arrow_mode else "Light bulb not detected"
                             elif bulb_match and area_match:
                                 status = "Both matched"
                             elif bulb_match:
                                 status = "Area not detected"
                             elif area_match:
-                                status = "Light bulb not detected"
+                                status = "Character arrows not detected" if arrow_mode else "Light bulb not detected"
                             else:
                                 status = "No matches"
                             self._set_results(
@@ -918,7 +934,10 @@ class AlignmentOverlay:
                     spam_on or self.app.shop_controller.state != "idle"
                 )
                 if waiting:
-                    label = "SELLING" if self.app.spam_paused_reason.startswith("Selling") else "SPAMMER WAITING"
+                    reason = self.app.spam_paused_reason
+                    label = ("SELLING" if reason.startswith("Selling") else
+                             "BUFFING" if reason.startswith("Buffing") else
+                             "SPAMMER WAITING")
                     color = "#ffc400"
                 else:
                     label = "SPAMMER ON" if spam_on else "SPAMMER OFF"
@@ -1035,42 +1054,58 @@ class VosApp:
         self.refresh_status()
         log("VoS helper started")
 
-    def _build_ui(self):
-        scroll_host = ttk.Frame(self.root)
-        scroll_host.pack(fill="both", expand=True)
-        self.settings_canvas = tk.Canvas(scroll_host, highlightthickness=0, borderwidth=0)
-        scrollbar = ttk.Scrollbar(
-            scroll_host,
-            orient="vertical",
-            command=self.settings_canvas.yview,
-        )
-        self.settings_canvas.configure(yscrollcommand=scrollbar.set)
+    def _add_settings_tab(self, title):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text=title)
+        canvas = tk.Canvas(tab, highlightthickness=0, borderwidth=0)
+        scrollbar = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
-        self.settings_canvas.pack(side="left", fill="both", expand=True)
+        canvas.pack(side="left", fill="both", expand=True)
+        outer = ttk.Frame(canvas, padding=12)
+        window_id = canvas.create_window((0, 0), window=outer, anchor="nw")
+        outer.bind("<Configure>", lambda _event, c=canvas: c.configure(scrollregion=c.bbox("all")))
+        canvas.bind("<Configure>", lambda event, c=canvas, item=window_id:
+                    c.itemconfigure(item, width=event.width))
+        self.tab_canvases[str(tab)] = canvas
+        return outer
 
-        outer = ttk.Frame(self.settings_canvas, padding=12)
-        self.settings_window = self.settings_canvas.create_window(
-            (0, 0),
-            window=outer,
-            anchor="nw",
-        )
-        outer.bind(
-            "<Configure>",
-            lambda _event: self.settings_canvas.configure(
-                scrollregion=self.settings_canvas.bbox("all")
-            ),
-        )
-        self.settings_canvas.bind(
-            "<Configure>",
-            lambda event: self.settings_canvas.itemconfigure(
-                self.settings_window,
-                width=event.width,
-            ),
-        )
+    def _restore_logs_height(self, event):
+        if self._logs_restored or event.height < 220:
+            return
+        desired = max(70, int(self.config.get("log_panel_height", 130)))
+        self._logs_restored = True
+        self.main_paned.sashpos(0, max(100, event.height - desired))
+
+    def _build_ui(self):
+        header = ttk.Frame(self.root, padding=(16, 10, 16, 4))
+        header.pack(side="top", fill="x")
+        ttk.Label(header, text="VoS Helper", font=("Segoe UI", 12, "bold")).pack(side="left")
+        tk.Button(
+            header, text="SAVE SETTINGS", command=self.save,
+            bg="#1769aa", fg="white", activebackground="#0d4f86",
+            activeforeground="white", font=("Segoe UI", 9, "bold"),
+            relief="flat", cursor="hand2", padx=16, pady=7,
+        ).pack(side="right")
+        status = ttk.LabelFrame(self.root, text="Live status", padding=8)
+        status.pack(side="top", fill="x", padx=16, pady=(0, 6))
+        self.main_paned = ttk.PanedWindow(self.root, orient="vertical")
+        self.main_paned.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+        self.notebook = ttk.Notebook(self.main_paned)
+        self.main_paned.add(self.notebook, weight=4)
+        logs = ttk.LabelFrame(self.main_paned, text="Recent logs (drag divider above to resize)", padding=6)
+        self.log_panel = logs
+        self.main_paned.add(logs, weight=1)
+        self._logs_restored = False
+        self.main_paned.bind("<Configure>", self._restore_logs_height)
+        self.tab_canvases = {}
+        spam_tab = self._add_settings_tab("Spam")
+        alignment_tab = self._add_settings_tab("Alignment")
+        shop_tab = self._add_settings_tab("Shop")
+        checks_tab = self._add_settings_tab("Buff / Map")
+        general_tab = self._add_settings_tab("General")
         self.root.bind("<MouseWheel>", self.on_mousewheel)
 
-        status = ttk.LabelFrame(outer, text="Status", padding=10)
-        status.pack(fill="x")
         ttk.Label(status, text="DreamMS window:").grid(row=0, column=0, sticky="w")
         self.window_status = ttk.Label(status, text="Checking...")
         self.window_status.grid(row=0, column=1, sticky="w", padx=10)
@@ -1099,7 +1134,7 @@ class VosApp:
         self.thorns_status = ttk.Label(status, text="Off")
         self.thorns_status.grid(row=8, column=1, sticky="w", padx=10)
 
-        shop = ttk.LabelFrame(outer, text="Inventory / Selling", padding=10)
+        shop = ttk.LabelFrame(shop_tab, text="Inventory / Selling", padding=10)
         shop.pack(fill="x", pady=10)
         self.shop_enabled = tk.BooleanVar(value=self.config["shop_enabled"])
         self.inventory_debug = tk.BooleanVar(value=self.config["inventory_debug"])
@@ -1109,6 +1144,9 @@ class VosApp:
             save_config(self.config)
         ttk.Checkbutton(shop, text="Enable automatic selling", variable=self.shop_enabled,
                         command=update_shop_options).pack(anchor="w")
+        self.shop_open_auto_sell = tk.BooleanVar(value=self.config["shop_open_auto_sell"])
+        ttk.Checkbutton(shop, text="Sell changed inventory if shop is already open",
+                        variable=self.shop_open_auto_sell).pack(anchor="w")
         ttk.Checkbutton(shop, text="Draw inventory debug box", variable=self.inventory_debug,
                         command=update_shop_options).pack(anchor="w")
         self.shop_status = ttk.Label(shop, text="Off")
@@ -1127,6 +1165,10 @@ class VosApp:
         self.inventory_check_rate = ttk.Entry(shop, width=14)
         self.inventory_check_rate.insert(0, str(self.config["inventory_checks_per_second"]))
         self.inventory_check_rate.pack(anchor="w")
+        ttk.Label(shop, text="Shop-open checks per second:").pack(anchor="w", pady=(6, 0))
+        self.shop_open_check_rate = ttk.Entry(shop, width=14)
+        self.shop_open_check_rate.insert(0, str(self.config["shop_open_checks_per_second"]))
+        self.shop_open_check_rate.pack(anchor="w")
         ttk.Label(shop, text="Inventory detection threshold (header):").pack(anchor="w", pady=(6, 0))
         self.inventory_detection_threshold = ttk.Entry(shop, width=14)
         self.inventory_detection_threshold.insert(0, str(self.config["inventory_detection_threshold"]))
@@ -1141,7 +1183,7 @@ class VosApp:
         self.shop_match_threshold.insert(0, str(self.config["shop_match_threshold"]))
         self.shop_match_threshold.pack(anchor="w")
 
-        vos = ttk.LabelFrame(outer, text="VoS Spam", padding=10)
+        vos = ttk.LabelFrame(spam_tab, text="VoS Spam", padding=10)
         vos.pack(fill="x", pady=(10, 0))
         self.vos_enabled = tk.BooleanVar(value=bool(self.config["vos_enabled"]))
         ttk.Checkbutton(vos, text="Enable VoS function", variable=self.vos_enabled,
@@ -1185,7 +1227,7 @@ class VosApp:
         ttk.Checkbutton(vos, text="Draw box around detected Yeti/Crown", variable=self.show_yeti_overlay,
                         command=update_yeti_overlay).grid(row=9, column=0, columnspan=2, sticky="w")
 
-        buff = ttk.LabelFrame(outer, text="Thorns Buff", padding=10)
+        buff = ttk.LabelFrame(checks_tab, text="Thorns Buff", padding=10)
         buff.pack(fill="x", pady=(10, 0))
         self.buff_enabled = tk.BooleanVar(value=bool(self.config["buff_enabled"]))
         ttk.Checkbutton(
@@ -1215,7 +1257,7 @@ class VosApp:
         self.thorns_threshold.insert(0, str(self.config["thorns_match_threshold"]))
         self.thorns_threshold.grid(row=5, column=1, sticky="w")
 
-        checker = ttk.LabelFrame(outer, text="VoS Map Checker", padding=10)
+        checker = ttk.LabelFrame(checks_tab, text="VoS Map Checker", padding=10)
         checker.pack(fill="x", pady=(10, 0))
         self.map_checker_enabled = tk.BooleanVar(value=bool(self.config["vos_map_checker_enabled"]))
         ttk.Checkbutton(
@@ -1233,7 +1275,7 @@ class VosApp:
         self.map_threshold.insert(0, str(self.config["vos_map_match_threshold"]))
         self.map_threshold.grid(row=2, column=1, sticky="w")
 
-        overlay = ttk.LabelFrame(outer, text="Character / Area Alignment Test", padding=10)
+        overlay = ttk.LabelFrame(alignment_tab, text="Character / Area Alignment Test", padding=10)
         overlay.pack(fill="x", pady=(10, 0))
         self.alignment_enabled = tk.BooleanVar(value=bool(self.config["alignment_overlay_enabled"]))
         ttk.Checkbutton(
@@ -1250,6 +1292,14 @@ class VosApp:
         self.alignment_threshold = ttk.Entry(overlay, width=14)
         self.alignment_threshold.insert(0, str(self.config["alignment_match_threshold"]))
         self.alignment_threshold.grid(row=2, column=1, sticky="w")
+        ttk.Label(overlay, text="Character marker (save to apply):").grid(row=15, column=0, sticky="w", pady=5)
+        self.character_tracker_mode = tk.StringVar(value=self.config["character_tracker_mode"])
+        ttk.Combobox(overlay, textvariable=self.character_tracker_mode,
+                     values=("lightbulb", "arrows"), state="readonly", width=12).grid(row=15, column=1, sticky="w")
+        ttk.Label(overlay, text="Arrow shape match threshold:").grid(row=16, column=0, sticky="w", pady=5)
+        self.arrow_match_threshold = ttk.Entry(overlay, width=14)
+        self.arrow_match_threshold.insert(0, str(self.config["arrow_match_threshold"]))
+        self.arrow_match_threshold.grid(row=16, column=1, sticky="w")
         self.auto_align_enabled = tk.BooleanVar(value=bool(self.config["auto_align_enabled"]))
         ttk.Checkbutton(
             overlay,
@@ -1356,7 +1406,7 @@ class VosApp:
         ).grid(row=14, column=1, sticky="ew", pady=5)
         self.update_spam_overlay_position_labels()
 
-        settings = ttk.LabelFrame(outer, text="General / Arduino", padding=10)
+        settings = ttk.LabelFrame(general_tab, text="General / Arduino", padding=10)
         settings.pack(fill="x", pady=(10, 0))
         ttk.Label(settings, text="Master toggle hotkey:").grid(row=0, column=0, sticky="w")
         self.master_key = ttk.Entry(settings, width=14)
@@ -1374,25 +1424,28 @@ class VosApp:
         self.baud_rate = ttk.Entry(settings, width=14)
         self.baud_rate.insert(0, str(self.config["baud_rate"]))
         self.baud_rate.grid(row=4, column=1, sticky="w")
-        ttk.Button(settings, text="Save settings", command=self.save).grid(row=5, column=0, pady=(8, 0), sticky="w")
-        ttk.Button(settings, text="Master On / Off", command=self.toggle_master).grid(row=5, column=1, pady=(8, 0), sticky="w")
+        ttk.Button(settings, text="Master On / Off", command=self.toggle_master).grid(row=5, column=0, pady=(8, 0), sticky="w")
 
-        logs = ttk.LabelFrame(outer, text="Recent logs", padding=6)
-        logs.pack(fill="both", expand=True, pady=(10, 0))
-        self.log_view = tk.Text(logs, height=8, state="disabled", wrap="word")
+        self.log_view = tk.Text(logs, height=4, state="disabled", wrap="word")
         self.log_view.pack(fill="both", expand=True)
 
     def on_mousewheel(self, event):
-        if not hasattr(self, "settings_canvas"):
+        if not hasattr(self, "notebook"):
             return
+        if event.widget == self.log_view:
+            return
+        canvas = self.tab_canvases.get(self.notebook.select())
         delta = int(getattr(event, "delta", 0))
-        if delta:
-            self.settings_canvas.yview_scroll(-1 if delta > 0 else 1, "units")
+        if canvas is not None and delta:
+            canvas.yview_scroll(-1 if delta > 0 else 1, "units")
 
     def read_form(self):
         inventory_rate = float(self.inventory_check_rate.get())
         if not 1 <= inventory_rate <= 30:
             raise ValueError("Inventory checks per second must be between 1 and 30.")
+        shop_open_rate = float(self.shop_open_check_rate.get())
+        if not 0.2 <= shop_open_rate <= 10:
+            raise ValueError("Shop-open checks per second must be between 0.2 and 10.")
         shop_thresholds = {
             "inventory_detection_threshold": float(self.inventory_detection_threshold.get()),
             "inventory_match_threshold": float(self.inventory_match_threshold.get()),
@@ -1406,6 +1459,8 @@ class VosApp:
             raise ValueError("Shop test hotkey must differ from master and VoS hotkeys.")
         self.config["shop_test_key"] = test_key
         self.config["inventory_checks_per_second"] = inventory_rate
+        self.config["shop_open_checks_per_second"] = shop_open_rate
+        self.config["shop_open_auto_sell"] = bool(self.shop_open_auto_sell.get())
         self.config.update(shop_thresholds)
         hold = float(self.hold.get())
         interval = float(self.interval.get())
@@ -1414,6 +1469,12 @@ class VosApp:
         threshold = float(self.map_threshold.get())
         alignment_rate = float(self.alignment_rate.get())
         alignment_threshold = float(self.alignment_threshold.get())
+        tracker_mode = self.character_tracker_mode.get()
+        if tracker_mode not in ("lightbulb", "arrows"):
+            raise ValueError("Character marker must be lightbulb or arrows.")
+        arrow_threshold = float(self.arrow_match_threshold.get())
+        if not 0.3 <= arrow_threshold <= 0.95:
+            raise ValueError("Arrow shape match threshold must be between 0.3 and 0.95.")
         auto_align_tolerance = int(self.auto_align_tolerance.get())
         auto_align_hold = float(self.auto_align_hold.get())
         auto_align_interval = float(self.auto_align_interval.get())
@@ -1469,6 +1530,8 @@ class VosApp:
             "alignment_overlay_enabled": bool(self.alignment_enabled.get()),
             "alignment_checks_per_second": alignment_rate,
             "alignment_match_threshold": alignment_threshold,
+            "character_tracker_mode": tracker_mode,
+            "arrow_match_threshold": arrow_threshold,
             "auto_align_enabled": bool(self.auto_align_enabled.get()),
             "auto_align_tolerance_pixels": auto_align_tolerance,
             "auto_align_key_hold": auto_align_hold,
@@ -1499,6 +1562,7 @@ class VosApp:
     def save(self):
         try:
             self.read_form()
+            self.config["log_panel_height"] = max(70, self.log_panel.winfo_height())
             save_config(self.config)
             ARDUINO.close()
             self.rebind_hotkeys()
@@ -1616,8 +1680,7 @@ class VosApp:
         self.config["buff_enabled"] = enabled
         self.buff_resume_not_before = 0.0
         if not enabled and self.spam_paused_reason and (
-            self.spam_paused_reason == "Casting Thorns"
-            or self.spam_paused_reason.startswith("Waiting for Thorns")
+            self.spam_paused_reason.startswith("Buffing")
         ):
             self.spam_paused_reason = None
         save_config(self.config)
@@ -1900,12 +1963,12 @@ class VosApp:
                 now = time.monotonic()
                 if now < self.buff_resume_not_before:
                     remaining = self.buff_resume_not_before - now
-                    self.spam_paused_reason = f"Waiting for Thorns ({remaining:.1f}s)"
+                    self.spam_paused_reason = f"Buffing ({remaining:.1f}s)"
                     if self.stop_event.wait(min(0.05, remaining)):
                         break
                     continue
                 if not self.thorns_detector.allows_spam():
-                    self.spam_paused_reason = "Casting Thorns"
+                    self.spam_paused_reason = "Buffing (casting Thorns)"
                     buff_key = normalize_output_key(self.config.get("buff_key", "END"))
                     buff_hold = max(0.001, float(self.config.get("buff_key_hold", 0.03)))
                     if self.config.get("use_arduino", True):
@@ -1918,7 +1981,7 @@ class VosApp:
                         return
                     wait_seconds = max(0.0, float(self.config.get("buff_wait_seconds", 5.0)))
                     self.buff_resume_not_before = time.monotonic() + wait_seconds
-                    self.spam_paused_reason = f"Waiting for Thorns ({wait_seconds:.1f}s)"
+                    self.spam_paused_reason = f"Buffing ({wait_seconds:.1f}s)"
                     log(f"Thorns missing: sent {buff_key}, waiting {wait_seconds:.1f}s")
                     if self.stop_event.wait(min(0.05, max(0.001, wait_seconds))):
                         break
@@ -1981,11 +2044,12 @@ class VosApp:
                 overlay_color = "green" if bulb is not None and target_ready else "orange"
             detail = ""
             if self.config.get("alignment_overlay_enabled", False):
+                marker_name = "arrows" if self.config.get("character_tracker_mode") == "arrows" else "bulb"
                 if self.config.get("alignment_target_mode", "area") == "manual":
                     offset = int(self.config.get("manual_anchor_offset", 0))
-                    detail = f" (bulb {bulb_score:.2f}, anchor {offset:+d}px)"
+                    detail = f" ({marker_name} {bulb_score:.2f}, anchor {offset:+d}px)"
                 else:
-                    detail = f" (bulb {bulb_score:.2f}, area {area_score:.2f})"
+                    detail = f" ({marker_name} {bulb_score:.2f}, area {area_score:.2f})"
             if self.config.get("show_crystal", False):
                 crystal_text = f", crystal {crystal_score:.2f}" if crystal is not None else ", crystal waiting"
                 detail = (detail[:-1] + crystal_text + ")") if detail else f" ({crystal_text[2:]})"

@@ -21,6 +21,13 @@ A separate Windows helper that repeatedly sends a selected key while
 
 Defaults: `F11` toggles the whole helper, and `F10` starts/stops VoS spam.
 The output key, hold time, repeat interval, COM port, and hotkeys are editable.
+The GUI keeps live Status and a prominent **Save settings** button at the top,
+Logs at the bottom, and
+groups feature controls into Spam, Alignment, Shop, Buff / Map, and General
+tabs. Save after editing entry fields or selecting the character marker;
+smaller windows can still scroll within each tab. Tabs are left-aligned. Drag
+the divider above Recent logs to resize the log area, then click **Save settings**
+to remember its height for the next launch.
 
 The spam loop stops automatically if DreamMS loses focus. Turning off Arduino
 mode uses Windows `SendInput` as a testing fallback.
@@ -30,8 +37,13 @@ The optional VoS Map Checker searches the active DreamMS client for
 the image is no longer detected. Detection rate and match threshold are
 configurable in the GUI.
 
-The optional Character / Area Alignment Test detects `assets/lightbulb.png`
-and `assets/area.png`. Its transparent, click-through overlay draws a cyan line
+The optional Character / Area Alignment Test can track either `assets/lightbulb.png`
+or the two-chevron shape derived at runtime from `assets/tracker.png` (choose
+**arrows** under Character marker, then save). The arrows use a shape/edge model
+instead of matching their changing colors or the background in the PNG. Arrow
+tracking has its own shape threshold (default `0.60`); raise it if scenery
+causes false matches. The lightbulb keeps the alignment match threshold.
+The tracker also detects `assets/area.png`. Its transparent, click-through overlay draws a cyan line
 downward from the character marker and a green vertical target line through the
 middle of the rock-area template. The status row shows both live match scores.
 
@@ -85,6 +97,15 @@ The inventory check rate is adjustable from 1 to 30 checks per second (default 5
 This controls how often the inventory debug box and selling image checks update;
 higher rates use more CPU. Enter a rate and save settings to apply it.
 
+While VoS spam is running, the bot also checks `shop_open.png` for a shop that
+was opened unexpectedly. The shop-open check rate is separate (default once per
+second, adjustable from 0.2 to 10 per second). If the inventory is clean or
+`invent_empty.png` is visible, it closes the shop. If the inventory has changed,
+the **Sell changed inventory if shop is already open** option continues the
+selling sequence when automatic selling is enabled; otherwise it closes the
+shop. Spam pauses while the shop is being handled. If inventory cannot be
+classified, the bot waits rather than selling blindly.
+
 Inventory-triggered automatic selling requires VoS spam to be ON. The enabled
 F8 shop test can still run one cycle with spam OFF. DreamMS must be foreground.
 
@@ -100,6 +121,9 @@ The sequence clicks `shop.png`, waits for `shop_open.png`, clicks
 are spaced by one second and spam/movement pause throughout selling. The shop
 must disappear before spam resumes. Missing templates leave the sequence
 waiting rather than advancing blindly.
+
+The in-game badge and VoS status say **BUFFING** while the Thorns buff key is
+being cast or the configured post-cast wait is in progress.
 
 Character and green target alignment guides hide temporarily during selling
 and return afterward if their overlay checkbox is enabled. The saved checkbox

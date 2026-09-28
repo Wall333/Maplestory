@@ -18,6 +18,8 @@ class ShopController:
         self.matches = {}
         self.checked = 0.0
         self.next_action = 0.0
+        self.shop_open_checked = 0.0
+        self.shop_open_rect = None
         self.templates = {}
         self.thread = threading.Thread(target=self.detect, daemon=True, name="shop-detector")
 
@@ -58,7 +60,8 @@ class ShopController:
                 while not self.stop_event.is_set():
                     started = time.monotonic()
                     rate = max(1.0, min(30.0, float(self.app.config.get("inventory_checks_per_second", 5))))
-                    if not (self.app.config.get("shop_enabled") or self.app.config.get("inventory_debug") or self.test_cycle):
+                    if not (self.app.config.get("shop_enabled") or self.app.config.get("inventory_debug")
+                            or self.app.spam_active or self.test_cycle):
                         self.status = "Off"
                         self.stop_event.wait(.2)
                         continue
@@ -68,6 +71,8 @@ class ShopController:
                             self.context = None
                             self.inventory_rect = None
                             self.changed = False
+                            self.shop_open_rect = None
+                            self.shop_open_checked = 0.0
                         self.status = "Game inactive"
                         self.stop_event.wait(.2)
                         continue
@@ -75,6 +80,14 @@ class ShopController:
                     threshold = float(self.app.config.get("shop_match_threshold", .9))
                     matches = {}
                     for name, template in self.templates.items():
+                        if name == "shop_open":
+                            shop_rate = max(.2, min(10.0, float(self.app.config.get("shop_open_checks_per_second", 1))))
+                            if started - self.shop_open_checked < 1.0 / shop_rate:
+                                if self.shop_open_rect is not None:
+                                    matches[name] = self.shop_open_rect
+                                continue
+                            self.shop_open_checked = started
+                            self.shop_open_rect = None
                         h, w = template.shape[:2]
                         if frame.shape[0] < h or frame.shape[1] < w:
                             continue
@@ -82,6 +95,8 @@ class ShopController:
                         _, score, _, loc = cv.minMaxLoc(result)
                         if score >= threshold:
                             matches[name] = (loc[0], loc[1], w, h)
+                            if name == "shop_open":
+                                self.shop_open_rect = matches[name]
                     inventory = self.templates["inventory"]
                     ih, iw = inventory.shape[:2]
                     # The header does not change when inventory slots fill.
@@ -124,28 +139,42 @@ class ShopController:
 
     def tick(self):
         """Called by the spam worker; return True while selling owns inputs."""
-        if not self.app.config.get("shop_enabled", False) and not self.test_cycle:
-            if self.state != "idle":
-                self.app.stop_vos("Selling disabled during shop sequence")
-            self.reset()
-            return False
+        auto_sell = bool(self.app.config.get("shop_enabled", False))
         with self.lock:
             context, changed, checked = self.context, self.changed, self.checked
             matches = dict(self.matches)
+            inventory_rect = self.inventory_rect
         rate = max(1.0, min(30.0, float(self.app.config.get("inventory_checks_per_second", 5))))
-        max_age = max(.6, 2.0 / rate)
+        shop_rate = max(.2, min(10.0, float(self.app.config.get("shop_open_checks_per_second", 1))))
+        max_age = max(.6, 2.0 / rate, 1.0 / shop_rate + .2)
         if self.state == "idle":
-            if not changed or context is None or time.monotonic() - checked > max_age:
+            if context is None or time.monotonic() - checked > max_age:
                 return False
-            self.state = "open"
-            self.api["log"]("Selling: inventory changed; opening shop")
+            if "shop_open" in matches:
+                self.state = "inspect"
+                self.api["log"]("Shop already open: checking inventory")
+            elif changed and auto_sell:
+                self.state = "open"
+                self.api["log"]("Selling: inventory changed; opening shop")
+            else:
+                return False
         self.app.spam_paused_reason = "Selling: " + self.state
         if self.app.stop_event.is_set() or self.api["get_active_dreamms_context"]() != context:
             return True
         if context is None or time.monotonic() - checked > max_age or time.monotonic() < self.next_action:
             return True
         target = None
-        if self.state == "open":
+        if self.state == "inspect":
+            if "shop_open" not in matches:
+                self.reset()
+                return False
+            if "invent_empty" in matches or "inventory" in matches or (inventory_rect is not None and not changed):
+                self.state = "exit"
+                self.api["log"]("Shop open with clean/empty inventory: closing shop")
+            elif changed:
+                self.state = "sell" if auto_sell and self.app.config.get("shop_open_auto_sell", True) else "exit"
+                self.api["log"]("Shop open with changed inventory: " + ("selling" if self.state == "sell" else "closing shop"))
+        elif self.state == "open":
             if "shop_open" in matches:
                 self.state = "sell"
             elif changed or self.test_cycle:
